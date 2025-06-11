@@ -1,4 +1,5 @@
 # %%
+import cyipopt
 import numpy as np
 import plotly.graph_objects as go
 from scipy.optimize import linprog
@@ -77,7 +78,7 @@ def inner_distance(f, p, A, b, r=0.1, *args, **kwargs):
     in_dist = (1 / N * S) ** (-r)
     first_chain = -r * (in_dist / S)  # -r/N * (S ** (-r - 1))
     in_grad = first_chain * in_grad.reshape(1, -1)
-    return in_dist, in_grad
+    return -in_dist, -in_grad
 
 
 def outter_distance(f, p, A, b, *args, **kwargs):
@@ -101,13 +102,14 @@ def bulging(dist, grad_dist, p, pc, R, eps=1e-3, out=True):
     pc_ = np.array(pc).reshape(-1, 1)
     grad = np.array(grad_dist).reshape(1, -1)
     rho = 0.5 * (((p_ - pc_).T @ (p_ - pc_)) - R**2).item()
+    grad_rho = (p_ - pc_).T
     if not out:
         rho = -rho
-    grad_rho = (p_ - pc_).T
+        grad_rho = -grad_rho
     sqrt_term = np.sqrt((eps**2 * rho**2) + (1 - 2 * eps) * (dist**2))
     bulge_dist = eps * rho + sqrt_term
     bulge_grad = eps * grad_rho + 0.5 * (1 / sqrt_term) * (
-        2 * eps * rho * grad_rho + 2 * (1 - 2 * eps) * dist * grad
+        2 * (eps**2) * rho * grad_rho + 2 * (1 - 2 * eps) * dist * grad
     )
     return bulge_dist, bulge_grad
 
@@ -129,8 +131,8 @@ def e_s_hat(
     in_dist, in_grad = inner_distance(f, p, A, b, *args, **kwargs)
     if bulge:
         in_dist, in_grad = bulging(in_dist, in_grad, p, pc, R, eps=eps, out=False)
+        in_dist, in_grad = -in_dist, -in_grad
         out_dist, out_grad = bulging(out_dist, out_grad, p, pc, R, eps=eps)
-    in_dist = -1 * in_dist
 
     if kind == "out":
         return out_dist, out_grad
@@ -139,7 +141,56 @@ def e_s_hat(
     else:
         return out_dist + in_dist, out_grad + in_grad
 
+# GARBAGE IDEA FOR LEVEL SETS INTERPOLATION
+# def minminmin(x_fixed, x_vary, y_fixed, y_vary, A_list, b_list, func, *args, **kwargs):
+#     f_verticals = []
+#     f_horizontals = []
+#
+#     for A, b in zip(A_list, b_list):
+#         ith_vertical, ith_horizontal = [], []
+#
+#         for x in x_vary:
+#             p_hori = np.array([x, y_fixed])
+#             ith_horizontal.append(func(p_hori, A, b, *args, **kwargs))
+#         f_horizontals.append(np.min(ith_horizontal).item())
+#
+#         for y in y_vary:
+#             p_vert = np.array([x_fixed, y])
+#             ith_vertical.append(func(p_vert, A, b, *args, **kwargs))
+#         f_verticals.append(np.min(ith_vertical).item())
+#
+#     return np.minimum(np.min(f_verticals), np.min(f_horizontals))
+#
 
+class OptimalPathProblem:
+    def __init__(self, obstacles, q0, qd, f, phi, kappa, delta, n_points, bulge, R_list, pc_list,eps, min_path, r, h):
+        self.N = n_points
+        self.d = q0.shape[0]
+        self.f = f
+        self.phi = phi
+        self.q0 = q0
+        self.qd = qd
+        self.R_list = R_list
+        self.pc_list = pc_list
+        self.bulge = bulge
+        self.kappa = kappa
+        self.obstacles = obstacles
+        self.delta = delta
+        self.eps = eps
+        self.min_path = min_path
+        self.r = r
+        self.h = h
+        self.n = n_points * self.d # Total number of variables
+
+    def objective(self, x):
+        path = x.reshape(self.N, self.d)
+        dists = []
+        for p in path:
+            for i, obs in enumerate(obstacles):
+                A, b = obs
+                dist, _ = e_s_hat(p, A, b, self.phi, kind='in', bulge=self.bulge, R=R_list[i], pc=pc_list[i], eps=self.eps, r=self.r, h=self.h)
+
+#%%
 A1 = np.array([[1, 0], [-1, 0], [0, 1], [0, -1]])
 b1 = np.array([0.5, 0.5, 1, 0.5])
 # b1 = np.array([0.5, 0.5, 1, -0.5])
@@ -154,27 +205,6 @@ P1, P2 = np.meshgrid(p1, p2)
 P = np.vstack([P1.ravel(), P2.ravel()]).T
 distances = []
 d1_list, d2_list = [], []
-
-
-def minminmin(x_fixed, x_vary, y_fixed, y_vary, A_list, b_list, func, *args, **kwargs):
-    f_verticals = []
-    f_horizontals = []
-
-    for A, b in zip(A_list, b_list):
-        ith_vertical, ith_horizontal = [], []
-
-        for x in x_vary:
-            p_hori = np.array([x, y_fixed])
-            ith_horizontal.append(func(p_hori, A, b, *args, **kwargs))
-        f_horizontals.append(np.min(ith_horizontal).item())
-
-        for y in y_vary:
-            p_vert = np.array([x_fixed, y])
-            ith_vertical.append(func(p_vert, A, b, *args, **kwargs))
-        f_verticals.append(np.min(ith_vertical).item())
-
-    return np.minimum(np.min(f_verticals), np.min(f_horizontals))
-
 
 q0 = np.array([-1.15, 1.6]).reshape(-1, 1)
 qd = np.array([2.3, -1.75]).reshape(-1, 1)
@@ -201,8 +231,10 @@ h = 0.1
 r = 0.8
 eps = 5e-2
 bulge = True
-min_path = False
+min_path = True
 k = 5e-2
+max_iters = 100
+
 
 def deform_path(
     init_path,
@@ -218,9 +250,12 @@ def deform_path(
 ):
     path = init_path.copy()
     dists, grads = [], []
+    num_grads = []
+    delta_x = 1e-5  # Small perturbation for numerical gradient approximation
     for j, p_ in enumerate(init_path.T):
         p = p_.copy().reshape(-1, 1)
         dist, grad = 0, np.zeros((1, path.shape[0]))
+        num_grad = np.zeros((1, path.shape[0]))
         for i, obstacle in enumerate(obstacles):
             pc = pc_list[i]
             R = R_list[i]
@@ -230,31 +265,65 @@ def deform_path(
             )
             dist += dist_
             grad += grad_.reshape(1, -1)
+            pdx = np.array([delta_x, 0])
+            pdy = np.array([0, delta_x])
+            # Numerical gradient approximation
+            grad_curr = []
+            # for diff in [pdx, pdy]:
+            #     daux1, _ = e_s_hat(
+            #         p - diff,
+            #         A,
+            #         b,
+            #         phi,
+            #         kind="in",
+            #         bulge=bulge,
+            #         R=R,
+            #         pc=pc,
+            #         eps=eps,
+            #         r=r,
+            #         h=h,
+            #     )
+            #     daux2, _ = e_s_hat(
+            #         p + diff,
+            #         A,
+            #         b,
+            #         phi,
+            #         kind="in",
+            #         bulge=bulge,
+            #         R=R,
+            #         pc=pc,
+            #         eps=eps,
+            #         r=r,
+            #         h=h,
+            #     )
+                # grad_curr.append((daux2 - daux1) / (2 * delta_x))
+            # num_grad += np.array(grad_curr).reshape(1, -1)
         dists.append(dist)
         grads.append(grad.T / (np.linalg.norm(grad) + 1e-8))
+        num_grads.append(num_grad.T / (np.linalg.norm(num_grad) + 1e-8))
     min_idx = np.argmin(dists)
     min_dist, min_grad = dists[min_idx], grads[min_idx]
     # path = path - (min_grad * np.abs(dists))
-    grad_length = np.zeros((1, path.shape[1]))
-    if min_path:
-        direction = (path[:, 1:] - path[:, :-1])
-        grad_length = k *  direction / (np.linalg.norm(direction, axis=0) + 1e-8)
-        grad_length = np.hstack([np.array([0, 0]).reshape(2, -1), grad_length])
-        grad_length[:, -1] = np.array([0, 0])
-
-
     # path = path + (min_grad * dists)
     for j in range(path.shape[1]):
         const_obs = [b - A @ path[:, j].reshape(-1, 1) for A, b in obstacles]
         err = np.max(const_obs)
-        coeff = dists[j]
-        path[:, j] += (grads[j] * coeff).ravel() + grad_length[:, j].ravel()
+        # coeff = np.abs(dists[j])  # np.sign(dists[j]) * np.sqrt(np.abs(dists[j]))
+        coeff = np.sqrt(np.abs(dists[j]))
+        # print(grads[j])
+        path[:, j] += (grads[j] * coeff).ravel()
+    if min_path:
+        for j, point in enumerate(path.T[1:-1]):
+            k = j + 1
+            prev_grad = path[:, k-1].ravel() - point.ravel()
+            next_grad = path[:, k+1].ravel() - point.ravel()
+            path[:, k] = point + (prev_grad + next_grad) * 0.5
 
-    return path, min_dist, min_grad
+    return path, dists, grads, num_grads
 
 
-for _ in range(10):
-    path, min_dist, min_grad = deform_path(
+for _ in range(max_iters):
+    path, dists, grads, num_grads = deform_path(
         path,
         obstacles,
         R_list=R_list,
@@ -264,7 +333,7 @@ for _ in range(10):
         eps=eps,
         bulge=bulge,
         min_path=min_path,
-        k=k
+        k=k,
     )
 
 # for j, p in enumerate(init_path.T):
@@ -294,7 +363,7 @@ for j, pi in enumerate(P):
     # print(j)
     pi = pi.reshape(-1, 1)
     kind = "both"
-    bulge = True
+    bulge = bulge
     d1, grad_d1 = e_s_hat(
         pi,
         A1,
@@ -349,94 +418,173 @@ def add_polygon(fig, A, b):
         )
     )
 
+def create_plot(obstacles, q0, qd, R_list, pc_list, xgrid, ygrid, zgrid):
+    """Avoids nvim plotting multiple figures (due to iron.nvim)"""
+    fig = go.Figure()
+    
+    for A, b in obstacles:
+        add_polygon(fig, A, b)
 
-fig = go.Figure()
-add_polygon(fig, A1, b1)
-add_polygon(fig, A2, b2)
-
-fig.add_trace(
-    go.Scatter(
-        x=[q0[0, 0].item()],
-        y=[q0[1, 0].item()],
-        mode="markers",
-        marker=dict(color="green", size=10, symbol="x"),
-        name="q0",
-    )
-)
-fig.add_trace(
-    go.Scatter(
-        x=[qd[0, 0].item()],
-        y=[qd[1, 0].item()],
-        mode="markers",
-        marker=dict(color="blue", size=10, symbol="star"),
-        name="qd",
-    )
-)
-
-fig.add_trace(
-    go.Scatter(
-        x=init_path[0, :],
-        y=init_path[1, :],
-        mode="lines",
-        line=dict(color="cyan", width=2, dash="dash"),
-        name="Initial Path",
-    )
-)
-
-fig.add_trace(
-    go.Scatter(
-        x=path[0, :],
-        y=path[1, :],
-        mode="markers+lines",
-        line=dict(color="black", width=2),
-        name="Deformed Path",
-    )
-)
-
-# Plot auxiliary circle around polygons
-for pc, R in zip(pc_list, R_list):
     fig.add_trace(
         go.Scatter(
-            x=pc[0] + R * np.cos(np.linspace(0, 2 * np.pi, 100)),
-            y=pc[1] + R * np.sin(np.linspace(0, 2 * np.pi, 100)),
-            mode="lines",
-            line=dict(color="orange", width=1, dash="dot"),
-            name="Auxiliary Circle",
+            x=[q0[0, 0].item()],
+            y=[q0[1, 0].item()],
+            mode="markers",
+            marker=dict(color="green", size=10, symbol="x"),
+            name="q0",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[qd[0, 0].item()],
+            y=[qd[1, 0].item()],
+            mode="markers",
+            marker=dict(color="blue", size=10, symbol="star"),
+            name="qd",
         )
     )
 
+    fig.add_trace(
+        go.Scatter(
+            x=init_path[0, :],
+            y=init_path[1, :],
+            mode="lines",
+            line=dict(color="cyan", width=2, dash="dash"),
+            name="Initial Path",
+        )
+    )
 
-# fig.add_trace(go.Scatter(
-#     x=A[:, 0],
-#     y=A[:, 1],
-#     mode='markers',
-#     marker=dict(color='red', size=8),
-#     name='Vertices'
-# ))
+    fig.add_trace(
+        go.Scatter(
+            x=path[0, :],
+            y=path[1, :],
+            mode="markers+lines",
+            line=dict(color="black", width=2),
+            name="Deformed Path",
+        )
+    )
 
-# Add level sets
-contour = go.Contour(
-    x=p1,
-    y=p2,
-    z=distances,
-    colorscale="RdBu",
-    ncontours=50,
-    # contours=dict(
-    #     start=0,
-    #     end=np.max(distances),
-    #     size=0.1
-    # ),
-    name="Level Sets",
-)
-fig.add_trace(contour)
-# Update layout
-fig.update_layout(
-    xaxis_title="x1", yaxis_title="x2", showlegend=False, width=800, height=600
-)
+    # Plot auxiliary circle around polygons
+    for pc, R in zip(pc_list, R_list):
+        fig.add_trace(
+            go.Scatter(
+                x=pc[0] + R * np.cos(np.linspace(0, 2 * np.pi, 100)),
+                y=pc[1] + R * np.sin(np.linspace(0, 2 * np.pi, 100)),
+                mode="lines",
+                line=dict(color="orange", width=1, dash="dot"),
+                name="Auxiliary Circle",
+            )
+        )
+
+    # Add level sets
+    contour = go.Contour(
+        x=xgrid,
+        y=ygrid,
+        z=zgrid,
+        colorscale="RdBu",
+        ncontours=50,
+        # contours=dict(
+        #     start=0,
+        #     end=np.max(distances),
+        #     size=0.1
+        # ),
+        name="Level Sets",
+    )
+    fig.add_trace(contour)
+    # Update layout
+    fig.update_layout(
+        xaxis_title="x1", yaxis_title="x2", showlegend=False, width=800, height=600
+    )
+    return fig
+
+fig = create_plot(obstacles, q0, qd, R_list, pc_list, p1, p2, distances)
 fig.show()
 
+#%%
+"""TEST GRADIENT NUMERICALLY"""
+import plotly.express as px
 
-# %%
+delta_x = 1e-3  # Small perturbation for numerical gradient approximation
+num_grads, dists = [], []
+grads = []
+kind = 'both'
+bulge = True
+# def e_s_hat(p, A, b, f, r=0.1, *args, **kwargs):
+#     """Uses short-circuit algorithm"""
+#     N, m = A.shape
+#     in_dists, in_grad = [], np.zeros((1, m))
+#
+#     for i, ai in enumerate(A):
+#         ai = ai.reshape(-1, 1)
+#         s = (b[i] - ai.T @ p).item()
+#         f_val, f_grad = f(s, *args, **kwargs)
+#         if f_val != 0:
+#             in_dists.append(f_val ** (-1 / r))
+#             in_grad += (-1 / r) * (f_val ** ((-1 / r) - 1)) * f_grad * (-ai.T)
+#         else:
+#             in_dists.append(np.inf)
+#
+#     S = np.sum(in_dists)
+#     in_dist = (1 / N * S) ** (-r)
+#     first_chain = -r * (in_dist / S)  # -r/N * (S ** (-r - 1))
+#     in_grad = first_chain * in_grad.reshape(1, -1)
+#     return in_dist, in_grad
+#
+
+for p in init_path.T:
+    dist, grad = e_s_hat(
+        p,
+        A1,
+        b1,
+        phi,
+        kind=kind,
+        bulge=bulge,
+        R=R_list[0],
+        pc=pc_list[0],
+        eps=eps,
+        r=r,
+        h=h,
+    )
+    dists.append(dist)
+    pdx = np.array([delta_x, 0])
+    pdy = np.array([0, delta_x])
+    grad_curr = []
+    for diff in [pdx, pdy]:
+        daux1, _ = e_s_hat(
+            p - diff,
+            A1,
+            b1,
+            phi,
+            kind=kind,
+            bulge=bulge,
+            R=R_list[0],
+            pc=pc_list[0],
+            eps=eps,
+            r=r,
+            h=h,
+        )
+        daux2, _ = e_s_hat(
+            p + diff,
+            A1,
+            b1,
+            phi,
+            kind=kind,
+            bulge=bulge,
+            R=R_list[0],
+            pc=pc_list[0],
+            eps=eps,
+            r=r,
+            h=h,
+        )
+        grad_curr.append((daux2 - daux1) / (2 * delta_x))
+    grads.append(grad.T)
+    num_grads.append(np.array(grad_curr).reshape(-1, 1))
+idx = np.argmin(dists)
+print(grads[idx], num_grads[idx])
+test = [np.linalg.norm(g1 - g2) for g1, g2 in zip(grads, num_grads)]
+px.line(test)
+
+#%%
 """Create plotly animation of the path deformation"""
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
@@ -474,12 +622,13 @@ def animate_deformation_matplotlib(
     r=0.8,
     eps=5e-2,
     bulge=True,
+    min_path=True,
     frame_delay=200,  # ms between frames
 ):
     # Precompute all paths
     paths = [init_path.copy()]
     for iter_ in range(n_iters):
-        path, _, _ = deform_path(
+        path, _, *_ = deform_path(
             paths[-1],
             obstacles,
             R_list=R_list,
@@ -488,6 +637,7 @@ def animate_deformation_matplotlib(
             r=r,
             eps=eps,
             bulge=bulge,
+            min_path=min_path
         )
         paths.append(path)
 
@@ -546,18 +696,26 @@ animation = animate_deformation_matplotlib(
     distances=distances,  # 2D distance values
     R_list=R_list,  # List of radii for auxiliary circles
     pc_list=pc_list,  # List of center points for auxiliary circles
-    n_iters=10,
+    n_iters=max_iters,
     h=h,  # Smoothing parameter
     r=r,  # Exponent for distance function
     eps=eps,  # Bulging parameter
     bulge=bulge,  # Whether to apply bulging
+    min_path=min_path,
     frame_delay=500,  # Delay between frames in milliseconds
 )
 
 # To display in notebook
-from IPython.display import HTML
+from IPython.display import HTML, display
+import webbrowser
+from pathlib import Path
 
-HTML(animation.to_jshtml())
+def show_animation(animation, filename="anim.html"):
+    path = Path(filename).absolute()
+    animation.save(path, writer="html")
+    webbrowser.open(f"file://{path}")
+show_animation(animation)
+# display(HTML(animation.to_jshtml()))
 # %%
 
 
