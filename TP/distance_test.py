@@ -55,6 +55,7 @@ def phi(s, h=0.5, *args, **kwargs):
     else:
         val = np.log(np.cosh(s / h)) * h
         grad = np.tanh(s / h)
+        hess = (np.sech(s / h) ** 2) / h
 
     return val, grad
 
@@ -141,6 +142,7 @@ def e_s_hat(
     else:
         return out_dist + in_dist, out_grad + in_grad
 
+
 # GARBAGE IDEA FOR LEVEL SETS INTERPOLATION
 # def minminmin(x_fixed, x_vary, y_fixed, y_vary, A_list, b_list, func, *args, **kwargs):
 #     f_verticals = []
@@ -162,8 +164,26 @@ def e_s_hat(
 #     return np.minimum(np.min(f_verticals), np.min(f_horizontals))
 #
 
+
 class OptimalPathProblem:
-    def __init__(self, obstacles, q0, qd, f, phi, kappa, delta, n_points, bulge, R_list, pc_list,eps, min_path, r, h):
+    def __init__(
+        self,
+        obstacles,
+        q0,
+        qd,
+        f,
+        phi,
+        kappa,
+        delta,
+        n_points,
+        bulge,
+        R_list,
+        pc_list,
+        eps,
+        min_path,
+        r,
+        h,
+    ):
         self.N = n_points
         self.d = q0.shape[0]
         self.f = f
@@ -180,17 +200,167 @@ class OptimalPathProblem:
         self.min_path = min_path
         self.r = r
         self.h = h
-        self.n = n_points * self.d # Total number of variables
+        self.n = self.N * self.d  # Total number of variables
+        self.m = 2 * self.d + (self.N - 1)
 
     def objective(self, x):
         path = x.reshape(self.N, self.d)
         dists = []
         for p in path:
+            dist = 0
             for i, obs in enumerate(obstacles):
                 A, b = obs
-                dist, _ = e_s_hat(p, A, b, self.phi, kind='in', bulge=self.bulge, R=R_list[i], pc=pc_list[i], eps=self.eps, r=self.r, h=self.h)
+                d_, _ = e_s_hat(
+                    p.reshape(-1, 1),
+                    A,
+                    b,
+                    self.phi,
+                    kind="in",
+                    bulge=self.bulge,
+                    R=R_list[i],
+                    pc=pc_list[i],
+                    eps=self.eps,
+                    r=self.r,
+                    h=self.h,
+                )
+                dist += d_
+            dists.append(dist)
+        val = np.sum(dists)
+        curvature = sum(
+            np.linalg.norm(path[i + 2] - 2 * path[i + 1] + path[i]) ** 2
+            for i in range(self.N - 2)
+        )
+        # Negative val because min problem
+        return -val + self.kappa * curvature
 
-#%%
+    def gradient(self, x):
+        path = x.reshape(self.N, self.d)
+        jac = np.zeros((self.N, self.d))
+        for j, p in enumerate(path):
+            grad = np.zeros((1, self.d))
+            for i, obs in enumerate(obstacles):
+                A, b = obs
+                _, grad_ = e_s_hat(
+                    p.reshape(-1, 1),
+                    A,
+                    b,
+                    self.phi,
+                    kind="in",
+                    bulge=self.bulge,
+                    R=R_list[i],
+                    pc=pc_list[i],
+                    eps=self.eps,
+                    r=self.r,
+                    h=self.h,
+                )
+                grad += grad_
+            jac[j, :] = grad.ravel()
+        grad = -jac.reshape((self.N, self.d))
+
+        for i in range(self.N - 2):
+            v_aux = (path[i] - 2 * path[i + 1] + path[i + 2])
+            grad[i] += self.kappa * v_aux
+            grad[i + 1] += -2 * self.kappa * v_aux 
+            grad[i + 2] += self.kappa * v_aux
+
+        return grad.flatten()
+
+    def constraints(self, x):
+        path = x.reshape(self.N, self.d)
+        constraints_ = []
+        constraints_.extend(path[0] - self.q0.ravel())  # p_1 = q0
+        constraints_.extend(path[-1] - self.qd.ravel())  # p_N = qd
+        # ||p_{i+1} - p_i||<=delta
+        for i in range(self.N - 1):
+            constraints_.append(np.linalg.norm(path[i + 1] - path[i]))
+
+        return np.array(constraints_)
+
+    def jacobian(self, x):
+        path = x.reshape(self.N, self.d)
+        jac = np.zeros((self.m, self.n))
+        row = 0
+
+        # First 2d rows are equality consts
+        for i in range(self.d):
+            jac[row, i] = 1.0
+            row += 1
+
+        for i in range(self.d):
+            jac[row, i - self.d] = 1.0
+            row += 1
+
+        for i in range(self.N - 1):
+            idx_i = i * self.d
+            idx_ip1 = (i + 1) * self.d
+
+            diff = path[i + 1] - path[i]
+            norm = np.linalg.norm(diff)
+
+            if norm == 0:
+                grad_i = np.zeros(self.d)
+            else:
+                grad_i = -diff / norm
+            grad_ip1 = -grad_i
+            jac[row, idx_i:idx_i + self.d] = grad_i
+            jac[row, idx_ip1:idx_ip1 + self.d] = grad_ip1
+            row += 1
+
+        return jac.flatten()
+
+    def jacobianstructure(self):
+        # Full dense Jacobian: just return all indices
+        row_indices = []
+        col_indices = []
+        for row in range(self.m):
+            for col in range(self.n):
+                row_indices.append(row)
+                col_indices.append(col)
+        return np.array(row_indices), np.array(col_indices)
+    
+    def hessian(self, x, lagrange, obj_factor):
+        path = x.reshape(self.N, self.d)
+        hess = np.zeros(self.n, self.n)  # N*d x N*d
+
+        for j, p in enumerate(path):
+            hess_block = np.zeros((self.d, self.d))
+            for i, obs in enumerate(obstacles):
+                A, b = obs
+                _, _, hess_ = e_s_hat(
+                    p.reshape(-1, 1),
+                    A,
+                    b,
+                    self.phi,
+                    kind="in",
+                    bulge=self.bulge,
+                    R=R_list[i],
+                    pc=pc_list[i],
+                    eps=self.eps,
+                    r=self.r,
+                    h=self.h,
+                )
+                hess_block += hess_
+            start = j * self.d
+            hess[start: start + self.d, start:start + self.d] += obj_factor * hess_block
+        grad = -jac.reshape((self.N, self.d))
+
+        for i in range(self.N - 2):
+            v_aux = (path[i] - 2 * path[i + 1] + path[i + 2])
+            grad[i] += self.kappa * v_aux 
+            grad[i + 1] += -2 * self.kappa * v_aux 
+            grad[i + 2] += self.kappa * v_aux 
+
+        return grad.flatten()
+
+
+        # # Just tell IPOPT that the Jacobian is dense (could be optimized)
+        # return (
+        #     np.arange(self.m)[:, None].repeat(self.n, axis=1).flatten(),
+        #     np.tile(np.arange(self.n), self.m),
+        # )
+        #
+
+# %%
 A1 = np.array([[1, 0], [-1, 0], [0, 1], [0, -1]])
 b1 = np.array([0.5, 0.5, 1, 0.5])
 # b1 = np.array([0.5, 0.5, 1, -0.5])
@@ -210,15 +380,15 @@ q0 = np.array([-1.15, 1.6]).reshape(-1, 1)
 qd = np.array([2.3, -1.75]).reshape(-1, 1)
 qd = np.array([1.7, -1.75]).reshape(-1, 1)
 
-# q0 = np.array([-1.1, 0.45]).reshape(-1, 1)
-# qd = np.array([1.1, 0.45]).reshape(-1, 1)
+q0 = np.array([-1.1, 0.45]).reshape(-1, 1)
+qd = np.array([1.1, 0.45]).reshape(-1, 1)
 
 obstacles = [(A1, b1), (A2, b2)]
 pc_list = [[0, 0.25], [1.5, -1]]
 R_list = [0.91, 0.71]
 # obstacles = [(A1, b1)]
 
-lambda_ = np.linspace(0, 1, 100)
+lambda_ = np.linspace(0, 1, n_points)
 init_path = (1 - lambda_) * q0 + lambda_ * qd
 path = init_path.copy()
 neg_grad = []
@@ -296,7 +466,7 @@ def deform_path(
             #         r=r,
             #         h=h,
             #     )
-                # grad_curr.append((daux2 - daux1) / (2 * delta_x))
+            # grad_curr.append((daux2 - daux1) / (2 * delta_x))
             # num_grad += np.array(grad_curr).reshape(1, -1)
         dists.append(dist)
         grads.append(grad.T / (np.linalg.norm(grad) + 1e-8))
@@ -315,8 +485,8 @@ def deform_path(
     if min_path:
         for j, point in enumerate(path.T[1:-1]):
             k = j + 1
-            prev_grad = path[:, k-1].ravel() - point.ravel()
-            next_grad = path[:, k+1].ravel() - point.ravel()
+            prev_grad = path[:, k - 1].ravel() - point.ravel()
+            next_grad = path[:, k + 1].ravel() - point.ravel()
             path[:, k] = point + (prev_grad + next_grad) * 0.5
 
     return path, dists, grads, num_grads
@@ -418,10 +588,11 @@ def add_polygon(fig, A, b):
         )
     )
 
-def create_plot(obstacles, q0, qd, R_list, pc_list, xgrid, ygrid, zgrid):
+
+def create_plot(obstacles, q0, qd, R_list, pc_list, xgrid, ygrid, zgrid, path, init_path):
     """Avoids nvim plotting multiple figures (due to iron.nvim)"""
     fig = go.Figure()
-    
+
     for A, b in obstacles:
         add_polygon(fig, A, b)
 
@@ -497,17 +668,18 @@ def create_plot(obstacles, q0, qd, R_list, pc_list, xgrid, ygrid, zgrid):
     )
     return fig
 
-fig = create_plot(obstacles, q0, qd, R_list, pc_list, p1, p2, distances)
+
+fig = create_plot(obstacles, q0, qd, R_list, pc_list, p1, p2, distances, path, init_path)
 fig.show()
 
-#%%
+# %%
 """TEST GRADIENT NUMERICALLY"""
 import plotly.express as px
 
 delta_x = 1e-3  # Small perturbation for numerical gradient approximation
 num_grads, dists = [], []
 grads = []
-kind = 'both'
+kind = "both"
 bulge = True
 # def e_s_hat(p, A, b, f, r=0.1, *args, **kwargs):
 #     """Uses short-circuit algorithm"""
@@ -584,7 +756,57 @@ print(grads[idx], num_grads[idx])
 test = [np.linalg.norm(g1 - g2) for g1, g2 in zip(grads, num_grads)]
 px.line(test)
 
-#%%
+# %%
+""" IPOPT SOLUTION """
+from cyipopt import Problem
+
+kappa = 1
+delta = 3 * np.linalg.norm(init_path[:, 0] - init_path[:, -1])
+
+problem = OptimalPathProblem(
+    obstacles,
+    q0,
+    qd,
+    e_s_hat,
+    phi,
+    kappa,
+    delta,
+    n_points,
+    bulge,
+    R_list,
+    pc_list,
+    eps,
+    min_path,
+    r,
+    h,
+)
+# Bounds: no bounds on x
+x_L = np.full(problem.n, -np.inf)
+x_U = np.full(problem.n, np.inf)
+
+# Constraint bounds
+c_L = np.zeros(problem.m)
+c_U = np.zeros(problem.m)
+# First 2*d are equalities
+c_U[: 2 * 2] = 0.0
+# Last N-1 are upper bounds only (||p_{i+1} - p_i|| ≤ δ)
+c_U[2 * 2 :] = delta
+
+nlp = Problem(
+    n=problem.n, m=problem.m, problem_obj=problem, lb=x_L, ub=x_U, cl=c_L, cu=c_U
+)
+print(init_path.flatten().shape)
+x_opt, info = nlp.solve(init_path.T.flatten())
+
+print(x_opt, x_opt.shape)
+# %%
+print(x_opt.shape)
+print(info['obj_val'])
+fig = create_plot(obstacles, q0, qd, R_list, pc_list, p1, p2, distances, x_opt.reshape(n_points, 2).T, init_path)
+fig.show()
+
+
+# %%
 """Create plotly animation of the path deformation"""
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
@@ -637,7 +859,7 @@ def animate_deformation_matplotlib(
             r=r,
             eps=eps,
             bulge=bulge,
-            min_path=min_path
+            min_path=min_path,
         )
         paths.append(path)
 
@@ -710,10 +932,13 @@ from IPython.display import HTML, display
 import webbrowser
 from pathlib import Path
 
+
 def show_animation(animation, filename="anim.html"):
     path = Path(filename).absolute()
     animation.save(path, writer="html")
     webbrowser.open(f"file://{path}")
+
+
 show_animation(animation)
 # display(HTML(animation.to_jshtml()))
 # %%
