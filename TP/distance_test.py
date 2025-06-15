@@ -50,69 +50,94 @@ def phi(s, h=0.5, *args, **kwargs):
     h*log(cosh(x)), derivative is h*tanh(x), second derivative is h*sech(x)**2
     """
     if s < 0:
-        val = 0
-        grad = 0
+        val = 0.0
+        grad = 0.0
+        hess = 0.0
     else:
         val = np.log(np.cosh(s / h)) * h
         grad = np.tanh(s / h)
-        hess = (np.sech(s / h) ** 2) / h
+        hess = ((1 / np.cosh(s / h)) ** 2) / h
 
-    return val, grad
+    return val, grad, hess
 
 
 def inner_distance(f, p, A, b, r=0.1, *args, **kwargs):
     """Uses short-circuit algorithm"""
     N, m = A.shape
-    in_dists, in_grad = [], np.zeros((1, m))
-
+    in_dists, v_grad = [], np.zeros((1, m))
+    v_hessian = np.zeros((m, m))  # This nonzero only for i=j
     for i, ai in enumerate(A):
         ai = ai.reshape(-1, 1)
         s = (b[i] - ai.T @ p).item()
-        f_val, f_grad = f(s, *args, **kwargs)
+        f_val, f_grad, f_hess = f(s, *args, **kwargs)
         if f_val != 0:
             in_dists.append(f_val ** (-1 / r))
-            in_grad += (-1 / r) * (f_val ** ((-1 / r) - 1)) * f_grad * (-ai.T)
+            v_grad += (-1 / r) * (f_val ** ((-1 / r) - 1)) * f_grad * (-ai.T)
+            v_hessian += (
+                (-1 / r)
+                * (((-1 / r - 1) * (f_val ** (-1 / r - 2))) * ((f_grad) ** 2) + f_hess)
+                * (ai @ ai.T)
+            )
         else:
             in_dists.append(np.inf)
 
     S = np.sum(in_dists)
     in_dist = (1 / N * S) ** (-r)
     first_chain = -r * (in_dist / S)  # -r/N * (S ** (-r - 1))
-    in_grad = first_chain * in_grad.reshape(1, -1)
-    return -in_dist, -in_grad
+    in_grad = first_chain * v_grad.reshape(1, -1)
+    in_hessian = first_chain * v_hessian + ((r * (r + 1)) * in_dist / (S**2)) * (
+        v_grad.T @ v_grad
+    )
+    return -in_dist, -in_grad, -in_hessian
 
 
 def outter_distance(f, p, A, b, *args, **kwargs):
     N, m = A.shape
     out_dist, out_grad = [], np.zeros((1, m))
+    out_hessian = np.zeros((m, m))
 
     for i, ai in enumerate(A):
         ai = ai.reshape(-1, 1)
         s = (ai.T @ p - b[i]).item()
-        f_val, f_grad = f(s, *args, **kwargs)
+        f_val, f_grad, _ = f(s, *args, **kwargs)
         out_dist.append(f_val)
         out_grad += f_grad * ai.T
 
     out_dist = (1 / N) * np.sum(out_dist)
     out_grad = (1 / N) * out_grad.reshape(1, -1)
-    return out_dist, out_grad
+    return out_dist, out_grad, out_hessian
 
 
-def bulging(dist, grad_dist, p, pc, R, eps=1e-3, out=True):
+def bulging(dist, grad_dist, hess_dist, p, pc, R, eps=1e-3, out=True):
     p_ = np.array(p).reshape(-1, 1)
     pc_ = np.array(pc).reshape(-1, 1)
     grad = np.array(grad_dist).reshape(1, -1)
+    hess = np.array(hess_dist)
     rho = 0.5 * (((p_ - pc_).T @ (p_ - pc_)) - R**2).item()
     grad_rho = (p_ - pc_).T
+    hess_rho = np.eye(p_.shape[0])
     if not out:
         rho = -rho
         grad_rho = -grad_rho
-    sqrt_term = np.sqrt((eps**2 * rho**2) + (1 - 2 * eps) * (dist**2))
+        hess_rho = -hess_rho
+    beta = (eps**2 * rho**2) + (1 - 2 * eps) * (dist**2)
+    sqrt_term = np.sqrt(beta)
     bulge_dist = eps * rho + sqrt_term
-    bulge_grad = eps * grad_rho + 0.5 * (1 / sqrt_term) * (
+    grad_beta = (
         2 * (eps**2) * rho * grad_rho + 2 * (1 - 2 * eps) * dist * grad
     )
-    return bulge_dist, bulge_grad
+    hess_beta = (
+            2 * (eps ** 2) * (grad_rho.T @ grad_rho + rho * hess_rho)
+            + 2 * (1 - 2 * eps) * (grad.T @ grad + dist * hess)
+    )
+ 
+    bulge_grad = eps * grad_rho + 0.5 * (1 / sqrt_term) * grad_beta
+    bghess_t1 = eps * hess_rho
+    bghess_t2 = (1 / (2 * sqrt_term)) * hess_beta
+    bghess_t3 = -(1 / (4 * beta * sqrt_term)) * (grad_beta.T @ grad_beta)
+
+    bulge_hess = bghess_t1 + bghess_t2 + bghess_t3
+    return bulge_dist, bulge_grad, bulge_hess
 
 
 def e_s_hat(
@@ -128,19 +153,19 @@ def e_s_hat(
     *args,
     **kwargs,
 ):
-    out_dist, out_grad = outter_distance(f, p, A, b, *args, **kwargs)
-    in_dist, in_grad = inner_distance(f, p, A, b, *args, **kwargs)
+    out_dist, out_grad, out_hess = outter_distance(f, p, A, b, *args, **kwargs)
+    in_dist, in_grad, in_hess = inner_distance(f, p, A, b, *args, **kwargs)
     if bulge:
-        in_dist, in_grad = bulging(in_dist, in_grad, p, pc, R, eps=eps, out=False)
-        in_dist, in_grad = -in_dist, -in_grad
-        out_dist, out_grad = bulging(out_dist, out_grad, p, pc, R, eps=eps)
+        in_dist, in_grad, in_hess = bulging(in_dist, in_grad, in_hess, p, pc, R, eps=eps, out=False)
+        in_dist, in_grad, in_hess = -in_dist, -in_grad, -in_hess
+        out_dist, out_grad, out_hess = bulging(out_dist, out_grad, out_hess, p, pc, R, eps=eps)
 
     if kind == "out":
-        return out_dist, out_grad
+        return out_dist, out_grad, out_hess
     elif kind == "in":
-        return in_dist, in_grad
+        return in_dist, in_grad, in_hess
     else:
-        return out_dist + in_dist, out_grad + in_grad
+        return out_dist + in_dist, out_grad + in_grad, out_hess + in_hess
 
 
 # GARBAGE IDEA FOR LEVEL SETS INTERPOLATION
@@ -210,7 +235,7 @@ class OptimalPathProblem:
             dist = 0
             for i, obs in enumerate(obstacles):
                 A, b = obs
-                d_, _ = e_s_hat(
+                d_, *_ = e_s_hat(
                     p.reshape(-1, 1),
                     A,
                     b,
@@ -226,7 +251,7 @@ class OptimalPathProblem:
                 dist += d_
             dists.append(dist)
         val = np.sum(dists)
-        curvature = sum(
+        curvature = 0.5 * sum(
             np.linalg.norm(path[i + 2] - 2 * path[i + 1] + path[i]) ** 2
             for i in range(self.N - 2)
         )
@@ -240,7 +265,7 @@ class OptimalPathProblem:
             grad = np.zeros((1, self.d))
             for i, obs in enumerate(obstacles):
                 A, b = obs
-                _, grad_ = e_s_hat(
+                _, grad_, _ = e_s_hat(
                     p.reshape(-1, 1),
                     A,
                     b,
@@ -258,9 +283,9 @@ class OptimalPathProblem:
         grad = -jac.reshape((self.N, self.d))
 
         for i in range(self.N - 2):
-            v_aux = (path[i] - 2 * path[i + 1] + path[i + 2])
+            v_aux = path[i] - 2 * path[i + 1] + path[i + 2]
             grad[i] += self.kappa * v_aux
-            grad[i + 1] += -2 * self.kappa * v_aux 
+            grad[i + 1] += -2 * self.kappa * v_aux
             grad[i + 2] += self.kappa * v_aux
 
         return grad.flatten()
@@ -302,8 +327,8 @@ class OptimalPathProblem:
             else:
                 grad_i = -diff / norm
             grad_ip1 = -grad_i
-            jac[row, idx_i:idx_i + self.d] = grad_i
-            jac[row, idx_ip1:idx_ip1 + self.d] = grad_ip1
+            jac[row, idx_i : idx_i + self.d] = grad_i
+            jac[row, idx_ip1 : idx_ip1 + self.d] = grad_ip1
             row += 1
 
         return jac.flatten()
@@ -317,17 +342,18 @@ class OptimalPathProblem:
                 row_indices.append(row)
                 col_indices.append(col)
         return np.array(row_indices), np.array(col_indices)
-    
+
     def hessian(self, x, lagrange, obj_factor):
         path = x.reshape(self.N, self.d)
-        hess = np.zeros(self.n, self.n)  # N*d x N*d
+        hess = np.zeros((self.n, self.n)) # N*d x N*d
 
         for j, p in enumerate(path):
+            p_ = p.reshape(-1, 1)
             hess_block = np.zeros((self.d, self.d))
             for i, obs in enumerate(obstacles):
                 A, b = obs
                 _, _, hess_ = e_s_hat(
-                    p.reshape(-1, 1),
+                    p_,
                     A,
                     b,
                     self.phi,
@@ -341,24 +367,35 @@ class OptimalPathProblem:
                 )
                 hess_block += hess_
             start = j * self.d
-            hess[start: start + self.d, start:start + self.d] += obj_factor * hess_block
-        grad = -jac.reshape((self.N, self.d))
+            hess[start: start + self.d, start:start + self.d] += -obj_factor * hess_block
 
         for i in range(self.N - 2):
-            v_aux = (path[i] - 2 * path[i + 1] + path[i + 2])
-            grad[i] += self.kappa * v_aux 
-            grad[i + 1] += -2 * self.kappa * v_aux 
-            grad[i + 2] += self.kappa * v_aux 
+            hess_options = [
+                            (i, i, self.kappa),
+                            (i, i + 1, -2 * self.kappa),
+                            (i, i + 2, self.kappa),
+                            (i + 1, i, -2 * self.kappa),
+                            (i + 1, i + 1, 4 * self.kappa),
+                            (i + 1, i + 2, -2 * self.kappa),
+                            (i + 2, i, self.kappa),
+                            (i + 2, i + 1, -2 * self.kappa),
+                            (i + 2, i + 2, self.kappa),
+                         ]
+            for j, k, val in hess_options:
+                row, col = j * self.d, k * self.d
+                hess[row:row + self.d, col:col + self.d] += obj_factor * val * np.eye(self.d)
+            
+        row, col = self.hessianstructure()
+        return hess[row, col]
 
-        return grad.flatten()
-
-
-        # # Just tell IPOPT that the Jacobian is dense (could be optimized)
-        # return (
-        #     np.arange(self.m)[:, None].repeat(self.n, axis=1).flatten(),
-        #     np.tile(np.arange(self.n), self.m),
-        # )
-        #
+    def hessian_structure(self):
+        irow = []
+        jcol = []
+        for i in range(self.n):
+            for j in range(i + 1):  # Only lower triangle
+                irow.append(i)
+                jcol.append(j)
+        return np.array(irow), np.array(jcol)
 
 # %%
 A1 = np.array([[1, 0], [-1, 0], [0, 1], [0, -1]])
@@ -380,8 +417,8 @@ q0 = np.array([-1.15, 1.6]).reshape(-1, 1)
 qd = np.array([2.3, -1.75]).reshape(-1, 1)
 qd = np.array([1.7, -1.75]).reshape(-1, 1)
 
-q0 = np.array([-1.1, 0.45]).reshape(-1, 1)
-qd = np.array([1.1, 0.45]).reshape(-1, 1)
+# q0 = np.array([-1.1, 0.45]).reshape(-1, 1)
+# qd = np.array([1.1, 0.45]).reshape(-1, 1)
 
 obstacles = [(A1, b1), (A2, b2)]
 pc_list = [[0, 0.25], [1.5, -1]]
@@ -430,7 +467,7 @@ def deform_path(
             pc = pc_list[i]
             R = R_list[i]
             A, b = obstacle
-            dist_, grad_ = e_s_hat(
+            dist_, grad_, _ = e_s_hat(
                 p, A, b, phi, kind="in", bulge=bulge, R=R, pc=pc, eps=eps, r=r, h=h
             )
             dist += dist_
@@ -534,7 +571,7 @@ for j, pi in enumerate(P):
     pi = pi.reshape(-1, 1)
     kind = "both"
     bulge = bulge
-    d1, grad_d1 = e_s_hat(
+    d1, grad_d1, _ = e_s_hat(
         pi,
         A1,
         b1,
@@ -547,7 +584,7 @@ for j, pi in enumerate(P):
         r=r,
         h=h,
     )
-    d2, grad_d2 = e_s_hat(
+    d2, grad_d2, _ = e_s_hat(
         pi,
         A2,
         b2,
@@ -589,7 +626,9 @@ def add_polygon(fig, A, b):
     )
 
 
-def create_plot(obstacles, q0, qd, R_list, pc_list, xgrid, ygrid, zgrid, path, init_path):
+def create_plot(
+    obstacles, q0, qd, R_list, pc_list, xgrid, ygrid, zgrid, path, init_path
+):
     """Avoids nvim plotting multiple figures (due to iron.nvim)"""
     fig = go.Figure()
 
@@ -669,18 +708,21 @@ def create_plot(obstacles, q0, qd, R_list, pc_list, xgrid, ygrid, zgrid, path, i
     return fig
 
 
-fig = create_plot(obstacles, q0, qd, R_list, pc_list, p1, p2, distances, path, init_path)
+fig = create_plot(
+    obstacles, q0, qd, R_list, pc_list, p1, p2, distances, path, init_path
+)
 fig.show()
 
 # %%
 """TEST GRADIENT NUMERICALLY"""
 import plotly.express as px
 
-delta_x = 1e-3  # Small perturbation for numerical gradient approximation
-num_grads, dists = [], []
+delta_x = 1e-1  # Small perturbation for numerical gradient approximation
+num_grads, dists, hessians = [], [], []
+num_hessians = []
 grads = []
-kind = "both"
-bulge = True
+kind = "in"
+bulge = False
 # def e_s_hat(p, A, b, f, r=0.1, *args, **kwargs):
 #     """Uses short-circuit algorithm"""
 #     N, m = A.shape
@@ -704,7 +746,7 @@ bulge = True
 #
 
 for p in init_path.T:
-    dist, grad = e_s_hat(
+    dist, grad, _ = e_s_hat(
         p,
         A1,
         b1,
@@ -722,7 +764,7 @@ for p in init_path.T:
     pdy = np.array([0, delta_x])
     grad_curr = []
     for diff in [pdx, pdy]:
-        daux1, _ = e_s_hat(
+        daux1, *_ = e_s_hat(
             p - diff,
             A1,
             b1,
@@ -735,7 +777,7 @@ for p in init_path.T:
             r=r,
             h=h,
         )
-        daux2, _ = e_s_hat(
+        daux2, *_ = e_s_hat(
             p + diff,
             A1,
             b1,
@@ -755,10 +797,71 @@ idx = np.argmin(dists)
 print(grads[idx], num_grads[idx])
 test = [np.linalg.norm(g1 - g2) for g1, g2 in zip(grads, num_grads)]
 px.line(test)
+for p_ in path.T:
+    p = np.array(p_).reshape(-1, 1)
+    hess_numerical = np.zeros((2, 2))
+    delta = delta_x  # Use same delta as gradient check
+    dist, grad, hess_ana = e_s_hat(
+        p,
+        A1,
+        b1,
+        phi,
+        kind=kind,
+        bulge=bulge,
+        R=R_list[0],
+        pc=pc_list[0],
+        eps=eps,
+        r=r,
+        h=h,
+    )
 
+    hessians.append(hess_ana)
+ 
+    for j in range(2):
+        # Create basis vector
+        ej = np.zeros((2, 1)).reshape(-1, 1)
+        ej[j] = delta
+        # Perturb +ej
+        _, g_plus, _ = e_s_hat(
+            (p + ej).reshape(-1, 1),
+            A1,
+            b1,
+            phi,
+            kind=kind,
+            bulge=bulge,
+            R=R_list[0],
+            pc=pc_list[0],
+            eps=eps,
+            r=r,
+            h=h,
+        )
+        # Perturb -ej
+        _, g_minus, _ = e_s_hat(
+            (p - ej).reshape(-1, 1),
+            A1,
+            b1,
+            phi,
+            kind=kind,
+            bulge=bulge,
+            R=R_list[0],
+            pc=pc_list[0],
+            eps=eps,
+            r=r,
+            h=h,
+        )
+        # Compute j-th column of Hessian
+        hess_numerical[:, j] = ((g_plus - g_minus) / (2 * delta)).flatten()
+    num_hessians.append(hess_numerical)
+
+err_hess = [np.linalg.norm(h - num_hessians[i]) for i, h in enumerate(hessians)]
+print(err_hess)
+print(grads)
+print(hessians)
+px.line(err_hess)
 # %%
 """ IPOPT SOLUTION """
 from cyipopt import Problem
+import time
 
 kappa = 1
 delta = 3 * np.linalg.norm(init_path[:, 0] - init_path[:, -1])
@@ -780,6 +883,7 @@ problem = OptimalPathProblem(
     r,
     h,
 )
+
 # Bounds: no bounds on x
 x_L = np.full(problem.n, -np.inf)
 x_U = np.full(problem.n, np.inf)
@@ -795,14 +899,60 @@ c_U[2 * 2 :] = delta
 nlp = Problem(
     n=problem.n, m=problem.m, problem_obj=problem, lb=x_L, ub=x_U, cl=c_L, cu=c_U
 )
+# nlp.add_option('derivative_test', 'first-order')  # Checks gradient (first derivatives)
+# nlp.add_option('derivative_test_print_all', 'yes')  # Prints detailed results
+# nlp.add_option('print_level', 12)
+options = {
+    # Force first-order method (no second derivatives)
+    "hessian_approximation": "exact",
+    "derivative_test": "second-order",
+    # "derivative_test_print_all": "yes",
+    # "hessian_approximation": "limited-memory",
+    # 'gradient_approximation': 'finite-difference-values',
+    # 'jacobian_approximation': 'finite-difference-values',
+    # Configure L-BFGS parameters
+    # 'limited_memory_update_type': 'bfgs',  # Standard BFGS update
+    # 'limited_memory_max_history': 10,      # History size (10-50 is typical)
+    # Disable second-order features
+    # 'mehrotra_algorithm': 'no',           # Disable second-order correction
+    # 'fast_step_computation': 'no',         # Disable advanced step calc
+    "mu_strategy": "adaptive",
+    # 'linear_solver': 'mumps',
+    # Adjust convergence criteria for first-order method
+    "tol": 1e-3,  # Relax tolerance (default 1e-8)
+    "max_iter": 1000,  # Increase iteration limit
+    "acceptable_iter": 10,  # Stop after 10 "good enough" iters
+    # Output control
+    "print_level": 5,
+    "print_frequency_iter": 10,
+}
+for key in options.keys():
+    nlp.add_option(key, options[key])
+# nlp.add_option('max_iter', 100)
 print(init_path.flatten().shape)
+
+irow, jcol = problem.hessian_structure()
+print(f"Hessian size: {problem.n} x {problem.n}")
+print(f"Number of structure entries: {len(irow)}")
+time.sleep(5)
 x_opt, info = nlp.solve(init_path.T.flatten())
 
 print(x_opt, x_opt.shape)
 # %%
 print(x_opt.shape)
-print(info['obj_val'])
-fig = create_plot(obstacles, q0, qd, R_list, pc_list, p1, p2, distances, x_opt.reshape(n_points, 2).T, init_path)
+print(info["obj_val"])
+fig = create_plot(
+    obstacles,
+    q0,
+    qd,
+    R_list,
+    pc_list,
+    p1,
+    p2,
+    distances,
+    x_opt.reshape(n_points, 2).T,
+    init_path,
+)
 fig.show()
 
 
