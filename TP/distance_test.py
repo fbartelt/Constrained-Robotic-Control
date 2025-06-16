@@ -2,10 +2,11 @@
 import cyipopt
 import numpy as np
 import plotly.graph_objects as go
-from scipy.optimize import linprog
 from itertools import combinations
-from scipy.spatial import ConvexHull
+from scipy.spatial import HalfspaceIntersection, ConvexHull, Delaunay
+from scipy.optimize import linprog
 
+################## POLYGON RELATED FUNCTIONS ##################
 
 def get_polytope_vertices_opt(A, b, tol=1e-6):
     n_dim = A.shape[1]  # Dimension of the polytope (e.g., 2 for 2D)
@@ -33,6 +34,282 @@ def get_polytope_vertices_opt(A, b, tol=1e-6):
 
     return np.array(vertices)
 
+def is_point_inside_polygon(point, vertices):
+    """Check if point is inside a convex polygon defined by vertices."""
+    return Delaunay(vertices).find_simplex(point) >= 0
+
+def polygons_intersect(verts1, verts2):
+    """Check if two convex polygons intersect (via Delaunay test)."""
+    return (
+        np.any(Delaunay(verts1).find_simplex(verts2) >= 0) or
+        np.any(Delaunay(verts2).find_simplex(verts1) >= 0)
+    )
+def find_strictly_feasible_point(A, b):
+    """
+    Solve an LP to find a strictly feasible point x such that A x < b
+    """
+    m, n = A.shape
+    # Objective: maximize δ (slack)
+    c = np.zeros(n + 1)
+    c[-1] = -1  # Maximize δ ⇒ minimize -δ
+
+    # Constraints: A x + δ ||A_i|| ≤ b_i
+    norms = np.linalg.norm(A, axis=1)
+    A_lp = np.hstack((A, norms[:, None]))
+    bounds = [(None, None)] * n + [(0, None)]  # δ ≥ 0
+
+    res = linprog(c, A_ub=A_lp, b_ub=b, bounds=bounds, method='highs')
+    if res.success:
+        return res.x[:-1]  # Return x (ignore δ)
+    else:
+        raise ValueError("Could not find a strictly feasible point.")
+
+def generate_random_polygon(
+    max_vertices=20, radius_lim=(1e-1, 1.0), bbox=(-5, -5, 5, 5), seed=None
+):
+    rng = np.random.default_rng(seed)
+    num_vertices = rng.integers(3, max_vertices + 1).item()
+    radius = rng.uniform(radius_lim[0], radius_lim[1])
+    angles = np.sort(rng.uniform(0, 2 * np.pi, num_vertices))
+    vertices = np.array([radius * np.cos(angles), radius * np.sin(angles)]).T
+    # Calculate safe translation boundaries
+    xmin, ymin, xmax, ymax = bbox
+    offset = rng.uniform(
+        low=[xmin + radius, ymin + radius],
+        high=[xmax - radius, ymax - radius]
+    )
+    vertices += offset
+    hull = ConvexHull(vertices)
+    A = hull.equations[:, :-1]
+    b = -hull.equations[:, -1]
+    return A, b, vertices
+
+def generate_random_polygon_set(
+    n_polygons=4,
+    intersect_polygons=False,
+    q0=None,
+    qd=None,
+    max_vertices=20,
+    radius_lim=(1e-1, 1.0),
+    bbox=(-5, -5, 5, 5),
+    seed=None
+):
+    rng = np.random.default_rng(seed)
+    polygons = []
+    attempts = 0
+    max_attempts = 1000
+
+    while len(polygons) < n_polygons and attempts < max_attempts:
+        A, b, vertices = generate_random_polygon(
+            max_vertices=max_vertices,
+            radius_lim=radius_lim, 
+            bbox=bbox, 
+            seed=rng.integers(1e9)
+        )
+        attempts += 1
+
+        # Check q0, qd are outside
+        if q0 is not None and is_point_inside_polygon(q0.ravel(), vertices):
+            continue
+        if qd is not None and is_point_inside_polygon(qd.ravel(), vertices):
+            continue
+
+        # Check intersections with previous polygons
+        if not intersect_polygons:
+            if any(polygons_intersect(vertices, poly[2]) for poly in polygons):
+                continue
+
+        # Get center of polygon and radius of circumscribed circle
+        center = np.mean(vertices, axis=0)
+        radius = np.max(np.linalg.norm(vertices - center, axis=1)).item()
+
+        # Passed all checks
+        polygons.append((A, b, vertices, center, radius))
+
+    if attempts == max_attempts:
+        raise RuntimeError("Too many attempts to generate non-overlapping polygons")
+
+    return polygons
+
+################## PLOTTING RELATED FUNCTIONS ##################
+def add_polygon(fig, A, b):
+    interior_point = find_strictly_feasible_point(A, b)
+    halfspaces = np.hstack((A, -b[:, None]))
+    hs = HalfspaceIntersection(halfspaces, interior_point)
+    reconstructed_vertices = hs.intersections
+
+    # Use ConvexHull to order them
+    hull = ConvexHull(reconstructed_vertices)
+    ordered_vertices = reconstructed_vertices[hull.vertices]
+
+    x = np.append(ordered_vertices[:, 0], ordered_vertices[0, 0])
+    y = np.append(ordered_vertices[:, 1], ordered_vertices[0, 1])
+
+    fig.add_trace(go.Scatter(
+        x=x, y=y, fill="toself",
+        fillcolor="rgba(163, 159, 158, 0.2)",
+        line=dict(color="rgba(163, 159, 158, 1)"),
+    ))
+    # vertices = get_polytope_vertices_opt(A, b)
+    # hull = ConvexHull(vertices)
+    # # Add polygon
+    # fig.add_trace(
+    #     go.Scatter(
+    #         x=np.append(vertices[hull.vertices, 0], vertices[hull.vertices[0], 0]),
+    #         y=np.append(vertices[hull.vertices, 1], vertices[hull.vertices[0], 1]),
+    #         fill="toself",
+    #         fillcolor="rgba(163, 159, 158, 0.2)",
+    #         line=dict(color="rgba(163, 159, 158, 1)"),
+    #     )
+    # )
+
+def add_level_sets(fig, constraints, pc_list, R_list, eps=1e-3, r=1e-1, h=1e-1, bulge=True, bbox=(-5, -5, 5, 5), n_points=100):
+    x_min, y_min, x_max, y_max = bbox
+    p1 = np.linspace(x_min, x_max, n_points)
+    p2 = np.linspace(y_min, y_max, n_points)
+    P1, P2 = np.meshgrid(p1, p2)
+    P = np.vstack([P1.ravel(), P2.ravel()]).T
+    distances = []
+
+    for j, pi in enumerate(P):
+        # print(j)
+        pi = pi.reshape(-1, 1)
+        kind = "both"
+        pi_dists = []
+        for i, (A, b) in enumerate(constraints):
+            d_, *_ = e_s_hat(
+                pi,
+                A,
+                b,
+                phi,
+                kind=kind,
+                bulge=bulge,
+                pc=pc_list[i],
+                R=R_list[i],
+                eps=eps,
+                r=r,
+                h=h,
+            )
+            pi_dists.append(d_)
+        e_s = np.min(pi_dists)
+        distances.append(e_s)
+
+    distances = np.array(distances).reshape(P1.shape)
+    contour = go.Contour(
+        x=p1,
+        y=p2,
+        z=distances,
+        colorscale="RdBu",
+        ncontours=50,
+        # contours=dict(
+        #     start=0,
+        #     end=np.max(distances),
+        #     size=0.1
+        # ),
+        name="Level Sets",
+    )
+    fig.add_trace(contour)
+    
+def create_planning_plot(
+        constraints,
+        vertices,
+        pc_list, R_list,
+        q0,
+        qd,
+        path,
+        init_path,
+        bbox=(-5, -5, 5, 5),
+        n_points=100,
+        n_points_contour=None,
+        eps=1e-3,
+        r=1e-1,
+        h=1e-1,
+        bulge=True,
+        plot_cicles=False):
+    
+    fig = go.Figure()
+    q0_ = q0.reshape(-1, 1)
+    qd_ = qd.reshape(-1, 1)
+    path = path.copy().reshape(-1, n_points)
+    init_path = init_path.copy().reshape(-1, n_points)
+    
+    if n_points_contour is None:
+        n_points_contour = n_points
+
+    for A, b in constraints:
+        add_polygon(fig, A, b)
+
+    fig.add_trace(
+        go.Scatter(
+            x=[q0_[0, 0].item()],
+            y=[q0_[1, 0].item()],
+            mode="markers",
+            marker=dict(color="green", size=10, symbol="x"),
+            name="q0",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[qd_[0, 0].item()],
+            y=[qd_[1, 0].item()],
+            mode="markers",
+            marker=dict(color="blue", size=10, symbol="star"),
+            name="qd",
+        )
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=init_path[0, :],
+            y=init_path[1, :],
+            mode="lines",
+            line=dict(color="cyan", width=2, dash="dash"),
+            name="Initial Path",
+        )
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=path[0, :],
+            y=path[1, :],
+            mode="markers+lines",
+            line=dict(color="black", width=2),
+            name="Deformed Path",
+        )
+    )
+
+    if plot_cicles:
+        # Plot auxiliary circle around polygons
+        for pc, R in zip(pc_list, R_list):
+            fig.add_trace(
+                go.Scatter(
+                    x=pc[0] + R * np.cos(np.linspace(0, 2 * np.pi, 100)),
+                    y=pc[1] + R * np.sin(np.linspace(0, 2 * np.pi, 100)),
+                    mode="lines",
+                    line=dict(color="orange", width=1, dash="dot"),
+                    name="Auxiliary Circle",
+                )
+            )
+
+    add_level_sets(
+        fig,
+        constraints,
+        pc_list,
+        R_list,
+        eps=eps,
+        r=r,
+        h=h,
+        bulge=bulge,
+        bbox=bbox,
+        n_points=n_points
+    )
+    # Update layout
+    fig.update_layout(
+        xaxis_title="x1", yaxis_title="x2", showlegend=False, width=800, height=600
+    )
+
+    return fig
+################## DISTANCE RELATED FUNCTIONS ##################
 
 # def phi(s, h=0.1, *args, **kwargs):
 #     if s < 0:
@@ -70,23 +347,25 @@ def inner_distance(f, p, A, b, r=0.1, *args, **kwargs):
         ai = ai.reshape(-1, 1)
         s = (b[i] - ai.T @ p).item()
         f_val, f_grad, f_hess = f(s, *args, **kwargs)
-        if f_val != 0:
+        if f_val > 1e-6:
             in_dists.append(f_val ** (-1 / r))
             v_grad += (-1 / r) * (f_val ** ((-1 / r) - 1)) * f_grad * (-ai.T)
-            v_hessian += (
-                (-1 / r)
-                * (((-1 / r - 1) * (f_val ** (-1 / r - 2))) * ((f_grad) ** 2) + f_hess)
-                * (ai @ ai.T)
-            )
+            v_hessian += (-1 / r) * (
+                (-1/r - 1) * (f_val ** (-1 / r - 2)) * (f_grad ** 2)
+                + (f_val ** (-1/r - 1) * f_hess)
+            ) * (ai @ ai.T)
         else:
-            in_dists.append(np.inf)
+            # in_dists.append(np.inf)
+            in_dists.append((1e-6) ** (-1 / r))
 
     S = np.sum(in_dists)
     in_dist = (1 / N * S) ** (-r)
-    first_chain = -r * (in_dist / S)  # -r/N * (S ** (-r - 1))
+    # -r/N * (S ** (-r - 1)) * 1/N [* d(in_dist)/dS]
+    first_chain = -r * (in_dist / S)  # * 1 / N
     in_grad = first_chain * v_grad.reshape(1, -1)
-    in_hessian = first_chain * v_hessian + ((r * (r + 1)) * in_dist / (S**2)) * (
-        v_grad.T @ v_grad
+    in_hessian = first_chain * v_hessian + (
+        # (r(r+1)) * (S/N)**(-r-2) * 1/N * 1/N [d(v)/dS ** 2]
+        (r * (r + 1)) * (in_dist / (S**2)) * (v_grad.T @ v_grad)
     )
     return -in_dist, -in_grad, -in_hessian
 
@@ -121,7 +400,8 @@ def bulging(dist, grad_dist, hess_dist, p, pc, R, eps=1e-3, out=True):
         grad_rho = -grad_rho
         hess_rho = -hess_rho
     beta = (eps**2 * rho**2) + (1 - 2 * eps) * (dist**2)
-    sqrt_term = np.sqrt(beta)
+    # Add 1e-12 for numerical stability
+    sqrt_term = np.sqrt(beta + 1e-12)
     bulge_dist = eps * rho + sqrt_term
     grad_beta = (
         2 * (eps**2) * rho * grad_rho + 2 * (1 - 2 * eps) * dist * grad
@@ -130,11 +410,11 @@ def bulging(dist, grad_dist, hess_dist, p, pc, R, eps=1e-3, out=True):
             2 * (eps ** 2) * (grad_rho.T @ grad_rho + rho * hess_rho)
             + 2 * (1 - 2 * eps) * (grad.T @ grad + dist * hess)
     )
- 
+
     bulge_grad = eps * grad_rho + 0.5 * (1 / sqrt_term) * grad_beta
     bghess_t1 = eps * hess_rho
     bghess_t2 = (1 / (2 * sqrt_term)) * hess_beta
-    bghess_t3 = -(1 / (4 * beta * sqrt_term)) * (grad_beta.T @ grad_beta)
+    bghess_t3 = -(1 / (4 * beta ** 1.5)) * (grad_beta.T @ grad_beta)
 
     bulge_hess = bghess_t1 + bghess_t2 + bghess_t3
     return bulge_dist, bulge_grad, bulge_hess
@@ -166,7 +446,58 @@ def e_s_hat(
         return in_dist, in_grad, in_hess
     else:
         return out_dist + in_dist, out_grad + in_grad, out_hess + in_hess
+    
+################## SOLVE RELATED FUNCTIONS ##################
 
+def deform_path(
+    init_path,
+    obstacles,
+    R_list=[],
+    pc_list=[],
+    h=0.1,
+    r=0.8,
+    eps=5e-2,
+    bulge=False,
+    min_path=False,
+    k=1.0,
+):
+    path = init_path.copy()
+    dists, grads = [], []
+    num_grads = []
+    for j, p_ in enumerate(init_path.T):
+        p = p_.copy().reshape(-1, 1)
+        dist, grad = 0, np.zeros((1, path.shape[0]))
+        num_grad = np.zeros((1, path.shape[0]))
+        for i, obstacle in enumerate(obstacles):
+            pc = pc_list[i]
+            R = R_list[i]
+            A, b = obstacle
+            dist_, grad_, _ = e_s_hat(
+                p, A, b, phi, kind="in", bulge=bulge, R=R, pc=pc, eps=eps, r=r, h=h
+            )
+            dist += dist_
+            grad += grad_.reshape(1, -1)
+        dists.append(dist)
+        grads.append(grad.T / (np.linalg.norm(grad) + 1e-8))
+        num_grads.append(num_grad.T / (np.linalg.norm(num_grad) + 1e-8))
+    min_idx = np.argmin(dists)
+    min_dist, min_grad = dists[min_idx], grads[min_idx]
+
+    for j in range(path.shape[1]):
+        # const_obs = [b - A @ path[:, j].reshape(-1, 1) for A, b in obstacles]
+        # err = np.max(const_obs)
+        # coeff = np.abs(dists[j])  # np.sign(dists[j]) * np.sqrt(np.abs(dists[j]))
+        coeff = np.sqrt(np.abs(dists[j]))
+        path[:, j] += (grads[j] * coeff).ravel()
+
+    if min_path:
+        for j, point in enumerate(path.T[1:-1]):
+            k = j + 1
+            prev_grad = path[:, k - 1].ravel() - point.ravel()
+            next_grad = path[:, k + 1].ravel() - point.ravel()
+            path[:, k] = point + (prev_grad + next_grad) * 0.5
+
+    return path, dists, grads, num_grads
 
 # GARBAGE IDEA FOR LEVEL SETS INTERPOLATION
 # def minminmin(x_fixed, x_vary, y_fixed, y_vary, A_list, b_list, func, *args, **kwargs):
@@ -188,7 +519,6 @@ def e_s_hat(
 #
 #     return np.minimum(np.min(f_verticals), np.min(f_horizontals))
 #
-
 
 class OptimalPathProblem:
     def __init__(
@@ -229,7 +559,7 @@ class OptimalPathProblem:
         self.m = 2 * self.d + (self.N - 1)
 
     def objective(self, x):
-        path = x.reshape(self.N, self.d)
+        path = x.copy().reshape(self.N, self.d)
         dists = []
         for p in path:
             dist = 0
@@ -259,7 +589,7 @@ class OptimalPathProblem:
         return -val + self.kappa * curvature
 
     def gradient(self, x):
-        path = x.reshape(self.N, self.d)
+        path = x.copy().reshape(self.N, self.d)
         jac = np.zeros((self.N, self.d))
         for j, p in enumerate(path):
             grad = np.zeros((1, self.d))
@@ -291,18 +621,17 @@ class OptimalPathProblem:
         return grad.flatten()
 
     def constraints(self, x):
-        path = x.reshape(self.N, self.d)
+        path = x.copy().reshape(self.N, self.d)
         constraints_ = []
-        constraints_.extend(path[0] - self.q0.ravel())  # p_1 = q0
-        constraints_.extend(path[-1] - self.qd.ravel())  # p_N = qd
+        constraints_.extend((path[0] - self.q0.ravel()).tolist())  # p_1 = q0
+        constraints_.extend((path[-1] - self.qd.ravel()).tolist())# p_N = qd
         # ||p_{i+1} - p_i||<=delta
         for i in range(self.N - 1):
-            constraints_.append(np.linalg.norm(path[i + 1] - path[i]))
-
-        return np.array(constraints_)
+            constraints_.append(np.linalg.norm(path[i + 1] - path[i]).item())
+        return np.array(constraints_).ravel()
 
     def jacobian(self, x):
-        path = x.reshape(self.N, self.d)
+        path = x.copy().reshape(self.N, self.d)
         jac = np.zeros((self.m, self.n))
         row = 0
 
@@ -344,7 +673,7 @@ class OptimalPathProblem:
         return np.array(row_indices), np.array(col_indices)
 
     def hessian(self, x, lagrange, obj_factor):
-        path = x.reshape(self.N, self.d)
+        path = x.copy().reshape(self.N, self.d)
         hess = np.zeros((self.n, self.n)) # N*d x N*d
 
         for j, p in enumerate(path):
@@ -381,23 +710,130 @@ class OptimalPathProblem:
                             (i + 2, i + 1, -2 * self.kappa),
                             (i + 2, i + 2, self.kappa),
                          ]
-            for j, k, val in hess_options:
+            for (j, k, val) in hess_options:
                 row, col = j * self.d, k * self.d
                 hess[row:row + self.d, col:col + self.d] += obj_factor * val * np.eye(self.d)
-            
+
+        # Constraints Hessian:
+        # 2*self.d linear equality constraints
+        # self.N - 1 constraints ||p_{i+1} - p_{i}|| <= delta
+        for i in range(self.N - 1):
+            v = (path[i + 1] - path[i]).reshape(-1, 1)
+            norm_v = np.linalg.norm(v) + 1e-8
+            hess_base = (1 / (norm_v ** 3)) * (
+                            ((norm_v ** 2) * np.eye(self.d)) - (v @ v.T)
+                        )
+            lambda_i = lagrange[2*self.d + i]
+            hess_options = [
+                (i, i, hess_base),
+                (i, i+1, -hess_base),
+                (i+1, i, -hess_base),
+                (i+1, i+1, hess_base)
+            ]
+            for (j, k, val) in hess_options:
+                row, col = j * self.d, k * self.d
+                block = val * lambda_i
+                hess[row:row + self.d, col:col + self.d] += block
+
         row, col = self.hessianstructure()
+        if np.linalg.norm(hess - hess.T) != 0:
+            raise ValueError(f"hessian is not symmetric")
         return hess[row, col]
 
-    def hessian_structure(self):
-        irow = []
-        jcol = []
-        for i in range(self.n):
-            for j in range(i + 1):  # Only lower triangle
-                irow.append(i)
-                jcol.append(j)
-        return np.array(irow), np.array(jcol)
+    def hessianstructure(self):
+        i_lower, j_lower = np.tril_indices(self.n)
+        return i_lower, j_lower
+#%%
+"""RANDOM MAP"""
+max_polygons = 10
+max_vertices = 5
+bounding_box = (-20, -20, 20, 20)
+# Distance between vertices will be at least 2*first element, and at most
+# 2*second element of radius_limits:
+radius_limits = (1, 6)
+q0 = np.array([-15, -15]).reshape(-1, 1)
+# qd = np.array([15, 15]).reshape(-1, 1)
+qd = np.array([5, 17]).reshape(-1, 1)
+n_points = 50
+h = 0.1
+r = 0.8
+eps = 5e-2
+bulge = True
+min_path = True
+k = 5e-1
+max_iters = 4000
 
-# %%
+obstacles = generate_random_polygon_set(
+    n_polygons=max_polygons,
+    intersect_polygons=False,
+    q0=q0,
+    qd=qd,
+    max_vertices=max_vertices,
+    radius_lim=radius_limits,
+    bbox=bounding_box,
+    seed=100
+)
+A_list, b_list, vertices_list, pc_list, R_list = list(zip(*obstacles))
+constraints = [(A, b) for A, b in zip(A_list, b_list)]
+
+lambda_ = np.linspace(0, 1, n_points)
+init_path = (1 - lambda_) * q0 + lambda_ * qd
+path = init_path.copy()
+dists = [-100]
+iter_ = 0
+err_flag = False
+
+# While any dists is negative and iters < max_iters:
+while np.any(np.array(dists) < -1e-8):
+    
+    if iter_ > max_iters:
+        print(f"Reached max iterations: {max_iters}")
+        err_flag = True
+        break
+
+    path, dists, grads, num_grads = deform_path(
+        path,
+        constraints,
+        R_list=R_list,
+        pc_list=pc_list,
+        h=h,
+        r=r,
+        eps=eps,
+        bulge=bulge,
+        min_path=min_path,
+        k=k,
+    )
+
+    if iter_ % 10 == 0:
+        print(f"Iteration {iter_}: min dist = {np.min(dists)}")
+
+    iter_ += 1
+
+if not err_flag:
+    print(f"Deformation completed in {iter_} iterations with min dist = {np.min(dists)}")
+
+fig = create_planning_plot(
+    constraints,
+    vertices_list,
+    pc_list,
+    R_list,
+    q0,
+    qd,
+    path,
+    init_path,
+    bbox=bounding_box,
+    n_points=n_points,
+    n_points_contour=40,
+    eps=eps,
+    r=r,
+    h=h,
+    bulge=bulge,
+    plot_cicles=True
+)
+fig.show()
+
+#%%
+"""PREDEFINED MAP"""
 A1 = np.array([[1, 0], [-1, 0], [0, 1], [0, -1]])
 b1 = np.array([0.5, 0.5, 1, 0.5])
 # b1 = np.array([0.5, 0.5, 1, -0.5])
@@ -443,92 +879,6 @@ k = 5e-2
 max_iters = 100
 
 
-def deform_path(
-    init_path,
-    obstacles,
-    R_list=[],
-    pc_list=[],
-    h=0.1,
-    r=0.8,
-    eps=5e-2,
-    bulge=False,
-    min_path=False,
-    k=1.0,
-):
-    path = init_path.copy()
-    dists, grads = [], []
-    num_grads = []
-    delta_x = 1e-5  # Small perturbation for numerical gradient approximation
-    for j, p_ in enumerate(init_path.T):
-        p = p_.copy().reshape(-1, 1)
-        dist, grad = 0, np.zeros((1, path.shape[0]))
-        num_grad = np.zeros((1, path.shape[0]))
-        for i, obstacle in enumerate(obstacles):
-            pc = pc_list[i]
-            R = R_list[i]
-            A, b = obstacle
-            dist_, grad_, _ = e_s_hat(
-                p, A, b, phi, kind="in", bulge=bulge, R=R, pc=pc, eps=eps, r=r, h=h
-            )
-            dist += dist_
-            grad += grad_.reshape(1, -1)
-            pdx = np.array([delta_x, 0])
-            pdy = np.array([0, delta_x])
-            # Numerical gradient approximation
-            grad_curr = []
-            # for diff in [pdx, pdy]:
-            #     daux1, _ = e_s_hat(
-            #         p - diff,
-            #         A,
-            #         b,
-            #         phi,
-            #         kind="in",
-            #         bulge=bulge,
-            #         R=R,
-            #         pc=pc,
-            #         eps=eps,
-            #         r=r,
-            #         h=h,
-            #     )
-            #     daux2, _ = e_s_hat(
-            #         p + diff,
-            #         A,
-            #         b,
-            #         phi,
-            #         kind="in",
-            #         bulge=bulge,
-            #         R=R,
-            #         pc=pc,
-            #         eps=eps,
-            #         r=r,
-            #         h=h,
-            #     )
-            # grad_curr.append((daux2 - daux1) / (2 * delta_x))
-            # num_grad += np.array(grad_curr).reshape(1, -1)
-        dists.append(dist)
-        grads.append(grad.T / (np.linalg.norm(grad) + 1e-8))
-        num_grads.append(num_grad.T / (np.linalg.norm(num_grad) + 1e-8))
-    min_idx = np.argmin(dists)
-    min_dist, min_grad = dists[min_idx], grads[min_idx]
-    # path = path - (min_grad * np.abs(dists))
-    # path = path + (min_grad * dists)
-    for j in range(path.shape[1]):
-        const_obs = [b - A @ path[:, j].reshape(-1, 1) for A, b in obstacles]
-        err = np.max(const_obs)
-        # coeff = np.abs(dists[j])  # np.sign(dists[j]) * np.sqrt(np.abs(dists[j]))
-        coeff = np.sqrt(np.abs(dists[j]))
-        # print(grads[j])
-        path[:, j] += (grads[j] * coeff).ravel()
-    if min_path:
-        for j, point in enumerate(path.T[1:-1]):
-            k = j + 1
-            prev_grad = path[:, k - 1].ravel() - point.ravel()
-            next_grad = path[:, k + 1].ravel() - point.ravel()
-            path[:, k] = point + (prev_grad + next_grad) * 0.5
-
-    return path, dists, grads, num_grads
-
-
 for _ in range(max_iters):
     path, dists, grads, num_grads = deform_path(
         path,
@@ -566,64 +916,7 @@ for _ in range(max_iters):
 # min_idx = np.argmin(dists[start_idx:end_idx])
 # min_dist, min_grad = dists[start_idx + min_idx], grads[min_idx]
 # path[:, start_idx : end_idx] -= np.abs(min_dist) * 5 * min_grad
-for j, pi in enumerate(P):
-    # print(j)
-    pi = pi.reshape(-1, 1)
-    kind = "both"
-    bulge = bulge
-    d1, grad_d1, _ = e_s_hat(
-        pi,
-        A1,
-        b1,
-        phi,
-        kind=kind,
-        bulge=bulge,
-        pc=pc_list[0],
-        R=R_list[0],
-        eps=eps,
-        r=r,
-        h=h,
-    )
-    d2, grad_d2, _ = e_s_hat(
-        pi,
-        A2,
-        b2,
-        phi,
-        kind=kind,
-        bulge=bulge,
-        pc=pc_list[1],
-        R=R_list[1],
-        eps=eps,
-        r=r,
-        h=h,
-    )
-    d1_list.append(d1)
-    d2_list.append(d2)
-    e_s = d1 + d2
-    # k = 1e-6
-    # e_s = -1/k * np.log(np.exp(-k * d1) + np.exp(-k * d2))
-    e_s = np.minimum(d1, d2)  # OK outside, terrible inside
-    x, y = pi.ravel()
-    # e_s = minminmin(x.item(), p1, y.item(), p2, [A1, A2], [b1, b2], e_s_hat, f=phi, kind=kind, r=0.1, h=0.1)
-    distances.append(e_s)
 
-distances = np.array(distances).reshape(P1.shape)
-
-
-# Plot polygon and level sets (2D)
-def add_polygon(fig, A, b):
-    vertices = get_polytope_vertices_opt(A, b)
-    hull = ConvexHull(vertices)
-    # Add polygon
-    fig.add_trace(
-        go.Scatter(
-            x=np.append(vertices[hull.vertices, 0], vertices[hull.vertices[0], 0]),
-            y=np.append(vertices[hull.vertices, 1], vertices[hull.vertices[0], 1]),
-            fill="toself",
-            fillcolor="rgba(163, 159, 158, 0.2)",
-            line=dict(color="rgba(163, 159, 158, 1)"),
-        )
-    )
 
 
 def create_plot(
@@ -717,12 +1010,12 @@ fig.show()
 """TEST GRADIENT NUMERICALLY"""
 import plotly.express as px
 
-delta_x = 1e-1  # Small perturbation for numerical gradient approximation
+delta_x = 1e-4  # Small perturbation for numerical gradient approximation
 num_grads, dists, hessians = [], [], []
 num_hessians = []
 grads = []
 kind = "in"
-bulge = False
+bulge = True
 # def e_s_hat(p, A, b, f, r=0.1, *args, **kwargs):
 #     """Uses short-circuit algorithm"""
 #     N, m = A.shape
@@ -797,66 +1090,40 @@ idx = np.argmin(dists)
 print(grads[idx], num_grads[idx])
 test = [np.linalg.norm(g1 - g2) for g1, g2 in zip(grads, num_grads)]
 px.line(test)
-for p_ in path.T:
-    p = np.array(p_).reshape(-1, 1)
-    hess_numerical = np.zeros((2, 2))
-    delta = delta_x  # Use same delta as gradient check
-    dist, grad, hess_ana = e_s_hat(
-        p,
-        A1,
-        b1,
-        phi,
-        kind=kind,
-        bulge=bulge,
-        R=R_list[0],
-        pc=pc_list[0],
-        eps=eps,
-        r=r,
-        h=h,
-    )
 
-    hessians.append(hess_ana)
- 
-    for j in range(2):
-        # Create basis vector
-        ej = np.zeros((2, 1)).reshape(-1, 1)
-        ej[j] = delta
-        # Perturb +ej
-        _, g_plus, _ = e_s_hat(
-            (p + ej).reshape(-1, 1),
-            A1,
-            b1,
-            phi,
-            kind=kind,
-            bulge=bulge,
-            R=R_list[0],
-            pc=pc_list[0],
-            eps=eps,
-            r=r,
-            h=h,
-        )
-        # Perturb -ej
-        _, g_minus, _ = e_s_hat(
-            (p - ej).reshape(-1, 1),
-            A1,
-            b1,
-            phi,
-            kind=kind,
-            bulge=bulge,
-            R=R_list[0],
-            pc=pc_list[0],
-            eps=eps,
-            r=r,
-            h=h,
-        )
-        # Compute j-th column of Hessian
-        hess_numerical[:, j] = ((g_plus - g_minus) / (2 * delta)).flatten()
-    num_hessians.append(hess_numerical)
+
+delta = 1e-3  # try smaller values like 1e-5 or 1e-6 if needed
+for _ in range(10):
+    v = np.random.randn(2, 1)
+    v /= np.linalg.norm(v)  # unit direction
+
+    for p_ in path.T:
+        p = np.array(p_).reshape(-1, 1)
+
+        # Evaluate at p, p + delta v, p - delta v
+        f0, *_ = e_s_hat(p, A1, b1, phi, kind=kind, bulge=bulge,
+                         R=R_list[0], pc=pc_list[0], eps=eps, r=r, h=h)
+        f_plus, *_ = e_s_hat(p + delta * v, A1, b1, phi, kind=kind, bulge=bulge,
+                             R=R_list[0], pc=pc_list[0], eps=eps, r=r, h=h)
+        f_minus, *_ = e_s_hat(p - delta * v, A1, b1, phi, kind=kind, bulge=bulge,
+                              R=R_list[0], pc=pc_list[0], eps=eps, r=r, h=h)
+
+        # Scalar Hessian-vector product approximation
+        hess_scalar_fd = (f_plus - 2 * f0 + f_minus) / (delta**2)
+
+        # Compare to vᵀ @ H @ v from analytical Hessian
+        _, _, hess = e_s_hat(p, A1, b1, phi, kind=kind, bulge=bulge,
+                             R=R_list[0], pc=pc_list[0], eps=eps, r=r, h=h)
+        hess_scalar_ana = float(v.T @ hess @ v)
+        num_hessians.append(hess_scalar_fd)
+        hessians.append(hess_scalar_ana)
 
 err_hess = [np.linalg.norm(h - num_hessians[i]) for i, h in enumerate(hessians)]
-print(err_hess)
+print(test)
 print(grads)
+print(err_hess)
 print(hessians)
+print(num_hessians)
 px.line(err_hess)
 # %%
 """ IPOPT SOLUTION """
@@ -904,10 +1171,10 @@ nlp = Problem(
 # nlp.add_option('print_level', 12)
 options = {
     # Force first-order method (no second derivatives)
-    "hessian_approximation": "exact",
-    "derivative_test": "second-order",
+    # "hessian_approximation": "exact",
+    # "derivative_test": "second-order",
     # "derivative_test_print_all": "yes",
-    # "hessian_approximation": "limited-memory",
+    "hessian_approximation": "limited-memory",
     # 'gradient_approximation': 'finite-difference-values',
     # 'jacobian_approximation': 'finite-difference-values',
     # Configure L-BFGS parameters
@@ -931,14 +1198,17 @@ for key in options.keys():
 # nlp.add_option('max_iter', 100)
 print(init_path.flatten().shape)
 
-irow, jcol = problem.hessian_structure()
+irow, jcol = problem.hessianstructure()
 print(f"Hessian size: {problem.n} x {problem.n}")
 print(f"Number of structure entries: {len(irow)}")
-time.sleep(5)
+# time.sleep(5)
 x_opt, info = nlp.solve(init_path.T.flatten())
 
 print(x_opt, x_opt.shape)
+print(init_path.shape)
+# problem.hessian(init_path.flatten(), [1]*20, 1)
 # %%
+""" PRINT IPOPT"""
 print(x_opt.shape)
 print(info["obj_val"])
 fig = create_plot(
@@ -1091,63 +1361,88 @@ def show_animation(animation, filename="anim.html"):
 
 show_animation(animation)
 # display(HTML(animation.to_jshtml()))
+
 # %%
+import numpy as np
+import plotly.graph_objects as go
 
-
-def generate_random_polygon(
-    max_vertices=20, radius_lim=(1e-1, 1.0), bbox=(-5, -5, 5, 5), seed=None
-):
-    rng = np.random.default_rng(seed)
-    num_vertices = rng.integers(3, max_vertices + 1).item()
-    radius = rng.uniform(radius_lim[0], radius_lim[1])
-    angles = np.sort(rng.uniform(0, 2 * np.pi, num_vertices))
-    vertices = np.array([radius * np.cos(angles), radius * np.sin(angles)]).T
-    # Calculate safe translation boundaries
-    xmin, ymin, xmax, ymax = bbox
-    offset = rng.uniform(
-        np.maximum(xmin + radius, ymin + radius),
-        np.minimum(xmax - radius, ymax - radius),
-    )
-    vertices += np.array([offset, offset])
-    # hull = ConvexHull(vertices)
-
-    # Get polygon description in the form Ax ≤ b
-    A = []
-    b = []
-    for i in range(num_vertices):
-        j = (i + 1) % num_vertices
-        edge = vertices[j] - vertices[i]
-        normal = np.array([-edge[1], edge[0]])
-        # Normalize for numerical stability
-        norm = np.linalg.norm(normal)
-        if norm > 1e-8:  # Avoid division by zero
-            normal = normal / norm
-
-        A.append(normal)
-        b.append(np.dot(normal, vertices[i]))
-    A = np.array(A)
-    b = np.array(b)
-    return A, b, vertices
-
+q0 = np.array([-15, -15])
+qd = np.array([5, 5])
+polygons = generate_random_polygon_set(10, False, q0, qd, max_vertices=20, radius_lim=(0.5, 6),
+                                       bbox=(-20, -20, 20, 20), seed=42)
 
 fig = go.Figure()
+for A, b, original_vertices in polygons:
+    fig.add_trace(go.Scatter(
+        x=[q0[0]],
+        y=[q0[1]],
+        mode='markers',
+        marker=dict(symbol='cross')
+    ))
+    fig.add_trace(go.Scatter(
+        x=[qd[0]],
+        y=[qd[1]],
+        mode='markers',
+        marker=dict(symbol='star')
+    ))
+ 
+    # seed = 42 + i
+    # A, b, original_vertices = generate_random_polygon(
+    #     max_vertices=20,
+    #     radius_lim=(1, 6),
+    #     bbox=(-20, -20, 20, 20),
+    #     seed=seed)
+    # Slight shrink for numerical safety
+    epsilon = 1e-6 * 0
+    b_strict = b - epsilon
 
-max_vertices = 20
-radius_lim = (5, 10.0)
-bbox = (-500, -500, 500, 500)
-seed = None
-fig = go.Figure()
-rng = np.random.default_rng(seed)
-num_vertices = rng.integers(3, max_vertices + 1).item()
-radius = rng.uniform(radius_lim[0], radius_lim[1])
-angles = np.sort(rng.uniform(0, 2 * np.pi, num_vertices))
-vertices = np.array([radius * np.cos(angles), radius * np.sin(angles)]).T
-# Calculate safe translation boundaries
-xmin, ymin, xmax, ymax = bbox
-offset = rng.uniform(
-    np.maximum(xmin + radius, ymin + radius), np.minimum(xmax - radius, ymax - radius)
+    try:
+        interior_point = find_strictly_feasible_point(A, b)
+        halfspaces = np.hstack((A, -b[:, None]))
+        hs = HalfspaceIntersection(halfspaces, interior_point)
+        reconstructed_vertices = hs.intersections
+
+        # Use ConvexHull to order them
+        hull = ConvexHull(reconstructed_vertices)
+        ordered_vertices = reconstructed_vertices[hull.vertices]
+
+        x = np.append(ordered_vertices[:, 0], ordered_vertices[0, 0])
+        y = np.append(ordered_vertices[:, 1], ordered_vertices[0, 1])
+
+        fig.add_trace(go.Scatter(
+            x=x, y=y, mode='lines+markers', fill='toself',
+            name=f'Polygon {i+1}', line=dict(width=2)
+        ))
+
+    except Exception as e:
+        print(f"Polygon {i+1} failed to reconstruct: {e}")
+# for i in range(4):
+#     seed = 42 + i
+#     _, _, vertices = generate_random_polygon(seed=seed)
+#
+#     # Get convex hull to order the vertices
+#     hull = ConvexHull(vertices)
+#     hull_vertices = vertices[hull.vertices]
+#
+#     # Close the polygon
+#     x = np.append(hull_vertices[:, 0], hull_vertices[0, 0])
+#     y = np.append(hull_vertices[:, 1], hull_vertices[0, 1])
+#
+#     fig.add_trace(go.Scatter(
+#         x=x, y=y, mode='lines+markers', fill='toself',
+#         name=f'Polygon {i+1}',
+#         line=dict(width=2)
+#     ))
+#
+fig.update_layout(
+    title='Random Convex Polygons in 2D',
+    xaxis_title='x', yaxis_title='y',
+    xaxis=dict(scaleanchor='y', scaleratio=1),
+    showlegend=True,
+    width=700, height=700
 )
-vertices += np.array([offset, offset])
+
+#%%
 # hull = ConvexHull(vertices)
 
 # Get polygon description in the form Ax ≤ b
