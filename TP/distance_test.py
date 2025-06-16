@@ -5,7 +5,7 @@ import plotly.graph_objects as go
 from itertools import combinations
 from scipy.spatial import HalfspaceIntersection, ConvexHull, Delaunay
 from scipy.optimize import linprog
-
+from cyipopt import Problem
 ################## POLYGON RELATED FUNCTIONS ##################
 
 def get_polytope_vertices_opt(A, b, tol=1e-6):
@@ -34,16 +34,28 @@ def get_polytope_vertices_opt(A, b, tol=1e-6):
 
     return np.array(vertices)
 
-def is_point_inside_polygon(point, vertices):
-    """Check if point is inside a convex polygon defined by vertices."""
-    return Delaunay(vertices).find_simplex(point) >= 0
+def is_point_inside_polygon(point, A, b, tol=1e-6):
+    res = linprog(
+            c=[0.0, 0.0],  # dummy objective
+            A_ub=A,
+            b_ub=b,
+            bounds=[(point[0], point[0]), (point[1], point[1])],
+            method="highs"
+        )
+    return res.success and res.status == 0
 
-def polygons_intersect(verts1, verts2):
-    """Check if two convex polygons intersect (via Delaunay test)."""
-    return (
-        np.any(Delaunay(verts1).find_simplex(verts2) >= 0) or
-        np.any(Delaunay(verts2).find_simplex(verts1) >= 0)
+def polygons_intersect(A1, b1, A2, b2):
+    A_combined = np.vstack([A1, A2])
+    b_combined = np.vstack([b1.reshape(-1, 1), b2.reshape(-1, 1)])
+
+    res = linprog(
+        c=[0.0, 0.0],
+        A_ub=A_combined,
+        b_ub=b_combined,
+        bounds=(None, None),
+        method="highs"
     )
+    return res.success and res.status == 0
 def find_strictly_feasible_point(A, b):
     """
     Solve an LP to find a strictly feasible point x such that A x < b
@@ -82,7 +94,8 @@ def generate_random_polygon(
     hull = ConvexHull(vertices)
     A = hull.equations[:, :-1]
     b = -hull.equations[:, -1]
-    return A, b, vertices
+    area = hull.volume
+    return A, b, vertices, area
 
 def generate_random_polygon_set(
     n_polygons=4,
@@ -92,34 +105,40 @@ def generate_random_polygon_set(
     max_vertices=20,
     radius_lim=(1e-1, 1.0),
     bbox=(-5, -5, 5, 5),
+    min_area=None,
+    max_attempts=1000,
     seed=None
 ):
     rng = np.random.default_rng(seed)
     polygons = []
     attempts = 0
-    max_attempts = 1000
+
+    if min_area is None:
+        min_area = np.pi/2 * radius_lim[0] ** 2
 
     while len(polygons) < n_polygons and attempts < max_attempts:
-        A, b, vertices = generate_random_polygon(
+        A, b, vertices, area = generate_random_polygon(
             max_vertices=max_vertices,
-            radius_lim=radius_lim, 
-            bbox=bbox, 
+            radius_lim=radius_lim,
+            bbox=bbox,
             seed=rng.integers(1e9)
         )
         attempts += 1
 
-        # Check q0, qd are outside
-        if q0 is not None and is_point_inside_polygon(q0.ravel(), vertices):
+        if area < min_area:
             continue
-        if qd is not None and is_point_inside_polygon(qd.ravel(), vertices):
+ 
+        # Check q0, qd are outside
+        if q0 is not None and is_point_inside_polygon(q0.ravel(), A, b):
+            continue
+        if qd is not None and is_point_inside_polygon(qd.ravel(), A, b):
             continue
 
         # Check intersections with previous polygons
         if not intersect_polygons:
-            if any(polygons_intersect(vertices, poly[2]) for poly in polygons):
+            if any(polygons_intersect(A, b, Ap, bp) for (Ap, bp, _, _, _) in polygons):
                 continue
-
-        # Get center of polygon and radius of circumscribed circle
+       # Get center of polygon and radius of circumscribed circle
         center = np.mean(vertices, axis=0)
         radius = np.max(np.linalg.norm(vertices - center, axis=1)).item()
 
@@ -163,7 +182,7 @@ def add_polygon(fig, A, b):
     #     )
     # )
 
-def add_level_sets(fig, constraints, pc_list, R_list, eps=1e-3, r=1e-1, h=1e-1, bulge=True, bbox=(-5, -5, 5, 5), n_points=100):
+def add_level_sets(fig, constraints, pc_list, R_list, eps=1e-3, r=1e-1, h=1e-1, kint='both', bulge=True, bbox=(-5, -5, 5, 5), n_points=100):
     x_min, y_min, x_max, y_max = bbox
     p1 = np.linspace(x_min, x_max, n_points)
     p2 = np.linspace(y_min, y_max, n_points)
@@ -174,7 +193,6 @@ def add_level_sets(fig, constraints, pc_list, R_list, eps=1e-3, r=1e-1, h=1e-1, 
     for j, pi in enumerate(P):
         # print(j)
         pi = pi.reshape(-1, 1)
-        kind = "both"
         pi_dists = []
         for i, (A, b) in enumerate(constraints):
             d_, *_ = e_s_hat(
@@ -221,6 +239,7 @@ def create_planning_plot(
         bbox=(-5, -5, 5, 5),
         n_points=100,
         n_points_contour=None,
+        kind_countor=None,
         eps=1e-3,
         r=1e-1,
         h=1e-1,
@@ -235,6 +254,8 @@ def create_planning_plot(
     
     if n_points_contour is None:
         n_points_contour = n_points
+    if kind_countor is None:
+        kind_countor = kind
 
     for A, b in constraints:
         add_polygon(fig, A, b)
@@ -563,7 +584,7 @@ class OptimalPathProblem:
         dists = []
         for p in path:
             dist = 0
-            for i, obs in enumerate(obstacles):
+            for i, obs in enumerate(self.obstacles):
                 A, b = obs
                 d_, *_ = e_s_hat(
                     p.reshape(-1, 1),
@@ -572,8 +593,8 @@ class OptimalPathProblem:
                     self.phi,
                     kind="in",
                     bulge=self.bulge,
-                    R=R_list[i],
-                    pc=pc_list[i],
+                    R=self.R_list[i],
+                    pc=self.pc_list[i],
                     eps=self.eps,
                     r=self.r,
                     h=self.h,
@@ -593,7 +614,7 @@ class OptimalPathProblem:
         jac = np.zeros((self.N, self.d))
         for j, p in enumerate(path):
             grad = np.zeros((1, self.d))
-            for i, obs in enumerate(obstacles):
+            for i, obs in enumerate(self.obstacles):
                 A, b = obs
                 _, grad_, _ = e_s_hat(
                     p.reshape(-1, 1),
@@ -602,8 +623,8 @@ class OptimalPathProblem:
                     self.phi,
                     kind="in",
                     bulge=self.bulge,
-                    R=R_list[i],
-                    pc=pc_list[i],
+                    R=self.R_list[i],
+                    pc=self.pc_list[i],
                     eps=self.eps,
                     r=self.r,
                     h=self.h,
@@ -679,7 +700,7 @@ class OptimalPathProblem:
         for j, p in enumerate(path):
             p_ = p.reshape(-1, 1)
             hess_block = np.zeros((self.d, self.d))
-            for i, obs in enumerate(obstacles):
+            for i, obs in enumerate(self.obstacles):
                 A, b = obs
                 _, _, hess_ = e_s_hat(
                     p_,
@@ -688,8 +709,8 @@ class OptimalPathProblem:
                     self.phi,
                     kind="in",
                     bulge=self.bulge,
-                    R=R_list[i],
-                    pc=pc_list[i],
+                    R=self.R_list[i],
+                    pc=self.pc_list[i],
                     eps=self.eps,
                     r=self.r,
                     h=self.h,
@@ -745,15 +766,15 @@ class OptimalPathProblem:
         return i_lower, j_lower
 #%%
 """RANDOM MAP"""
-max_polygons = 10
-max_vertices = 5
+max_polygons = 20
+max_vertices = 6
 bounding_box = (-20, -20, 20, 20)
 # Distance between vertices will be at least 2*first element, and at most
 # 2*second element of radius_limits:
-radius_limits = (1, 6)
+radius_limits = (2, 6)
 q0 = np.array([-15, -15]).reshape(-1, 1)
 # qd = np.array([15, 15]).reshape(-1, 1)
-qd = np.array([5, 17]).reshape(-1, 1)
+qd = np.array([14, 9]).reshape(-1, 1)
 n_points = 50
 h = 0.1
 r = 0.8
@@ -761,7 +782,8 @@ eps = 5e-2
 bulge = True
 min_path = True
 k = 5e-1
-max_iters = 4000
+max_iters = 1000
+seed = 100 # 100 is cool
 
 obstacles = generate_random_polygon_set(
     n_polygons=max_polygons,
@@ -771,7 +793,7 @@ obstacles = generate_random_polygon_set(
     max_vertices=max_vertices,
     radius_lim=radius_limits,
     bbox=bounding_box,
-    seed=100
+    seed=seed
 )
 A_list, b_list, vertices_list, pc_list, R_list = list(zip(*obstacles))
 constraints = [(A, b) for A, b in zip(A_list, b_list)]
@@ -831,6 +853,108 @@ fig = create_planning_plot(
     plot_cicles=True
 )
 fig.show()
+
+# %%
+"""RANDOM MAP IPOPT"""
+kappa = 1
+delta = 3 * np.linalg.norm(init_path[:, 0] - init_path[:, -1])
+
+for A, b in constraints:
+    print(f"A: {A}, b: {b}")
+problem = OptimalPathProblem(
+    constraints,
+    q0,
+    qd,
+    e_s_hat,
+    phi,
+    kappa,
+    delta,
+    n_points,
+    bulge,
+    R_list,
+    pc_list,
+    eps,
+    min_path,
+    r,
+    h,
+)
+
+# Bounds: no bounds on x
+x_L = np.full(problem.n, -np.inf)
+x_U = np.full(problem.n, np.inf)
+
+# Constraint bounds
+c_L = np.zeros(problem.m)
+c_U = np.zeros(problem.m)
+# First 2*d are equalities
+c_U[: 2 * 2] = 0.0
+# Last N-1 are upper bounds only (||p_{i+1} - p_i|| ≤ δ)
+c_U[2 * 2 :] = delta
+# Minimum distance between points is the initial one
+c_L[2*2:] = np.linalg.norm(init_path[:, 2] - init_path[:, 1])
+
+nlp = Problem(
+    n=problem.n, m=problem.m, problem_obj=problem, lb=x_L, ub=x_U, cl=c_L, cu=c_U
+)
+# nlp.add_option('derivative_test', 'first-order')  # Checks gradient (first derivatives)
+# nlp.add_option('derivative_test_print_all', 'yes')  # Prints detailed results
+# nlp.add_option('print_level', 12)
+options = {
+    # Force first-order method (no second derivatives)
+    # "hessian_approximation": "exact",
+    # "derivative_test": "second-order",
+    # "derivative_test_print_all": "yes",
+    "hessian_approximation": "limited-memory",
+    # 'gradient_approximation': 'finite-difference-values',
+    # 'jacobian_approximation': 'finite-difference-values',
+    # Configure L-BFGS parameters
+    # 'limited_memory_update_type': 'bfgs',  # Standard BFGS update
+    # 'limited_memory_max_history': 10,      # History size (10-50 is typical)
+    # Disable second-order features
+    # 'mehrotra_algorithm': 'no',           # Disable second-order correction
+    # 'fast_step_computation': 'no',         # Disable advanced step calc
+    "mu_strategy": "adaptive",
+    # 'linear_solver': 'mumps',
+    # Adjust convergence criteria for first-order method
+    "tol": 1e-3,  # Relax tolerance (default 1e-8)
+    "max_iter": 1000,  # Increase iteration limit
+    "acceptable_iter": 10,  # Stop after 10 "good enough" iters
+    # Output control
+    "print_level": 5,
+    "print_frequency_iter": 10,
+}
+for key in options.keys():
+    nlp.add_option(key, options[key])
+# nlp.add_option('max_iter', 100)
+print(init_path.flatten().shape)
+
+irow, jcol = problem.hessianstructure()
+# print(f"Hessian size: {problem.n} x {problem.n}")
+# print(f"Number of structure entries: {len(irow)}")
+# time.sleep(5)
+x_opt, info = nlp.solve(init_path.T.flatten())
+
+opt_path = x_opt.copy().reshape(n_points, 2).T
+fig = create_planning_plot(
+    constraints,
+    vertices_list,
+    pc_list,
+    R_list,
+    q0,
+    qd,
+    opt_path,
+    init_path,
+    bbox=bounding_box,
+    n_points=n_points,
+    n_points_contour=40,
+    eps=eps,
+    r=r,
+    h=h,
+    bulge=bulge,
+    plot_cicles=True
+)
+fig.show()
+
 
 #%%
 """PREDEFINED MAP"""
