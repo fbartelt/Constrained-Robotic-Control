@@ -6,6 +6,7 @@ from itertools import combinations
 from scipy.spatial import HalfspaceIntersection, ConvexHull, Delaunay
 from scipy.optimize import linprog
 from cyipopt import Problem
+from numba import njit
 ################## POLYGON RELATED FUNCTIONS ##################
 
 def get_polytope_vertices_opt(A, b, tol=1e-6):
@@ -138,7 +139,7 @@ def generate_random_polygon_set(
         if not intersect_polygons:
             if any(polygons_intersect(A, b, Ap, bp) for (Ap, bp, _, _, _) in polygons):
                 continue
-       # Get center of polygon and radius of circumscribed circle
+        # Get center of polygon and radius of circumscribed circle
         center = np.mean(vertices, axis=0)
         radius = np.max(np.linalg.norm(vertices - center, axis=1)).item()
 
@@ -182,7 +183,20 @@ def add_polygon(fig, A, b):
     #     )
     # )
 
-def add_level_sets(fig, constraints, pc_list, R_list, eps=1e-3, r=1e-1, h=1e-1, kint='both', bulge=True, bbox=(-5, -5, 5, 5), n_points=100):
+def add_level_sets(
+        fig,
+        constraints,
+        pc_list,
+        R_list,
+        eps=1e-3,
+        r=1e-1,
+        h=1e-1,
+        kind='both',
+        bulge=True,
+        bbox=(-5, -5, 5, 5),
+        n_points=100,
+        ignore=[],
+        test_=False):
     x_min, y_min, x_max, y_max = bbox
     p1 = np.linspace(x_min, x_max, n_points)
     p2 = np.linspace(y_min, y_max, n_points)
@@ -190,26 +204,68 @@ def add_level_sets(fig, constraints, pc_list, R_list, eps=1e-3, r=1e-1, h=1e-1, 
     P = np.vstack([P1.ravel(), P2.ravel()]).T
     distances = []
 
-    for j, pi in enumerate(P):
+    for j, pi_ in enumerate(P):
         # print(j)
-        pi = pi.reshape(-1, 1)
+        pi = pi_.copy().reshape(-1, 1)
         pi_dists = []
-        for i, (A, b) in enumerate(constraints):
-            d_, *_ = e_s_hat(
-                pi,
-                A,
-                b,
-                phi,
-                kind=kind,
-                bulge=bulge,
-                pc=pc_list[i],
-                R=R_list[i],
-                eps=eps,
-                r=r,
-                h=h,
-            )
+        test_dists = []
+        for i, (A_, b_) in enumerate(constraints):
+            if ignore:
+                keep_mask = np.ones(A_.shape[0], dtype=bool)
+                keep_mask[ignore] = False
+                A = A_[keep_mask]
+                b = b_[keep_mask]
+                d_test, *_ = e_s_hat(
+                    pi,
+                    A,
+                    b,
+                    phi,
+                    kind=kind,
+                    bulge=bulge,
+                    pc=pc_list[i],
+                    R=R_list[i],
+                    eps=eps,
+                    r=r,
+                    h=h,
+                )
+                test_dists.append(d_test)
+            # else:
+            if True:
+                A = A_
+                b = b_
+                d_, *_ = e_s_hat(
+                    pi,
+                    A,
+                    b,
+                    phi,
+                    kind=kind,
+                    bulge=bulge,
+                    pc=pc_list[i],
+                    R=R_list[i],
+                    eps=eps,
+                    r=r,
+                    h=h,
+                )
             pi_dists.append(d_)
-        e_s = np.min(pi_dists)
+        if test_:
+            dist_wo_const = -(
+                (1/len(test_dists)) * np.sum(
+                    [abs(z) ** (-1 / r) for z in test_dists]
+                )) ** (-r)
+            # dist_w_const = -((1 / len(pi_dists)) * np.sum(
+            #     np.abs(pi_dists) ** (-1 / r)
+            # ) ** (-r))
+            r_ = r/10
+            dist_w_const = (-r_)*np.log(np.sum(np.exp(-np.array(pi_dists)/(r_))))
+            # dist_w_const = np.min(pi_dists)
+            e_s = np.minimum(np.min(pi_dists), dist_wo_const) # THIS WORKS
+            # e_s = np.minimum(dist_w_const, dist_wo_const)
+            e_s = -r_ * np.log(np.exp(-dist_wo_const/r_) + np.exp(-dist_w_const/r_))
+            # e_s = (0.5 *
+            #        (-dist_wo_const)**(1/r) + (-np.min(pi_dists))**(1/r)
+            #        ) ** (1/r)
+        else:
+            e_s = np.min(pi_dists)
         distances.append(e_s)
 
     distances = np.array(distances).reshape(P1.shape)
@@ -230,7 +286,6 @@ def add_level_sets(fig, constraints, pc_list, R_list, eps=1e-3, r=1e-1, h=1e-1, 
     
 def create_planning_plot(
         constraints,
-        vertices,
         pc_list, R_list,
         q0,
         qd,
@@ -244,7 +299,9 @@ def create_planning_plot(
         r=1e-1,
         h=1e-1,
         bulge=True,
-        plot_cicles=False):
+        plot_cicles=False,
+        ignore=[],
+        test_=False):
     
     fig = go.Figure()
     q0_ = q0.reshape(-1, 1)
@@ -255,7 +312,7 @@ def create_planning_plot(
     if n_points_contour is None:
         n_points_contour = n_points
     if kind_countor is None:
-        kind_countor = kind
+        kind_countor = 'both'
 
     for A, b in constraints:
         add_polygon(fig, A, b)
@@ -320,9 +377,12 @@ def create_planning_plot(
         eps=eps,
         r=r,
         h=h,
+        kind=kind_countor,
         bulge=bulge,
         bbox=bbox,
-        n_points=n_points
+        n_points=n_points,
+        ignore=ignore,
+        test_=test_,
     )
     # Update layout
     fig.update_layout(
@@ -343,7 +403,8 @@ def create_planning_plot(
 #     return val, grad
 
 
-def phi(s, h=0.5, *args, **kwargs):
+@njit
+def phi(s, h=0.5, r=0.1): 
     """Smooth approximation of the distance function
     h*log(cosh(x)), derivative is h*tanh(x), second derivative is h*sech(x)**2
     """
@@ -359,17 +420,19 @@ def phi(s, h=0.5, *args, **kwargs):
     return val, grad, hess
 
 
-def inner_distance(f, p, A, b, r=0.1, *args, **kwargs):
+@njit
+def inner_distance(f, p, A, b, r=0.1, h=0.5):
     """Uses short-circuit algorithm"""
     N, m = A.shape
-    in_dists, v_grad = [], np.zeros((1, m))
+    in_dists, v_grad = 0.0, np.zeros((1, m))
     v_hessian = np.zeros((m, m))  # This nonzero only for i=j
-    for i, ai in enumerate(A):
-        ai = ai.reshape(-1, 1)
+    for i, ai_ in enumerate(A):
+        ai = ai_.copy().reshape(-1, 1)
         s = (b[i] - ai.T @ p).item()
-        f_val, f_grad, f_hess = f(s, *args, **kwargs)
+        f_val, f_grad, f_hess = f(s, h)
         if f_val > 1e-6:
-            in_dists.append(f_val ** (-1 / r))
+            # in_dists.append(f_val ** (-1 / r))
+            in_dists += (f_val ** (-1 / r))
             v_grad += (-1 / r) * (f_val ** ((-1 / r) - 1)) * f_grad * (-ai.T)
             v_hessian += (-1 / r) * (
                 (-1/r - 1) * (f_val ** (-1 / r - 2)) * (f_grad ** 2)
@@ -377,9 +440,11 @@ def inner_distance(f, p, A, b, r=0.1, *args, **kwargs):
             ) * (ai @ ai.T)
         else:
             # in_dists.append(np.inf)
-            in_dists.append((1e-6) ** (-1 / r))
+            # in_dists.append((1e-6) ** (-1 / r))
+            in_dists += 1e-6 ** (-1 / r)
 
-    S = np.sum(in_dists)
+    # S = np.sum(in_dists)
+    S = in_dists
     in_dist = (1 / N * S) ** (-r)
     # -r/N * (S ** (-r - 1)) * 1/N [* d(in_dist)/dS]
     first_chain = -r * (in_dist / S)  # * 1 / N
@@ -391,31 +456,35 @@ def inner_distance(f, p, A, b, r=0.1, *args, **kwargs):
     return -in_dist, -in_grad, -in_hessian
 
 
-def outter_distance(f, p, A, b, *args, **kwargs):
+@njit
+def outter_distance(f, p, A, b, r=0.1, h=0.5):
     N, m = A.shape
-    out_dist, out_grad = [], np.zeros((1, m))
+    out_dist, out_grad = 0.0, np.zeros((1, m))
     out_hessian = np.zeros((m, m))
 
-    for i, ai in enumerate(A):
-        ai = ai.reshape(-1, 1)
+    for i, ai_ in enumerate(A):
+        ai = ai_.copy().reshape(-1, 1)
         s = (ai.T @ p - b[i]).item()
-        f_val, f_grad, _ = f(s, *args, **kwargs)
-        out_dist.append(f_val)
+        f_val, f_grad, _ = f(s, r=r, h=h)
+        # out_dist.append(f_val)
+        out_dist += f_val
         out_grad += f_grad * ai.T
 
-    out_dist = (1 / N) * np.sum(out_dist)
+    out_dist = (1 / N) * out_dist #np.sum(out_dist)
     out_grad = (1 / N) * out_grad.reshape(1, -1)
     return out_dist, out_grad, out_hessian
 
 
+@njit
 def bulging(dist, grad_dist, hess_dist, p, pc, R, eps=1e-3, out=True):
-    p_ = np.array(p).reshape(-1, 1)
-    pc_ = np.array(pc).reshape(-1, 1)
-    grad = np.array(grad_dist).reshape(1, -1)
-    hess = np.array(hess_dist)
+    p_ = np.asarray(p).reshape(-1, 1)
+    m = p_.shape[0]
+    pc_ = np.asarray(pc).reshape(-1, 1)
+    grad = np.asarray(grad_dist).reshape(1, -1)
+    hess = np.asarray(hess_dist).reshape((m, m))
     rho = 0.5 * (((p_ - pc_).T @ (p_ - pc_)) - R**2).item()
     grad_rho = (p_ - pc_).T
-    hess_rho = np.eye(p_.shape[0])
+    hess_rho = np.eye(m)
     if not out:
         rho = -rho
         grad_rho = -grad_rho
@@ -428,8 +497,8 @@ def bulging(dist, grad_dist, hess_dist, p, pc, R, eps=1e-3, out=True):
         2 * (eps**2) * rho * grad_rho + 2 * (1 - 2 * eps) * dist * grad
     )
     hess_beta = (
-            2 * (eps ** 2) * (grad_rho.T @ grad_rho + rho * hess_rho)
-            + 2 * (1 - 2 * eps) * (grad.T @ grad + dist * hess)
+            2 * (eps ** 2) * ((grad_rho.T @ grad_rho) + rho * hess_rho)
+            + 2 * (1 - 2 * eps) * ((grad.T @ grad) + dist * hess)
     )
 
     bulge_grad = eps * grad_rho + 0.5 * (1 / sqrt_term) * grad_beta
@@ -441,6 +510,7 @@ def bulging(dist, grad_dist, hess_dist, p, pc, R, eps=1e-3, out=True):
     return bulge_dist, bulge_grad, bulge_hess
 
 
+@njit
 def e_s_hat(
     p,
     A,
@@ -451,11 +521,11 @@ def e_s_hat(
     R=None,
     pc=None,
     eps=1e-3,
-    *args,
-    **kwargs,
+    r=0.1,
+    h=0.5,
 ):
-    out_dist, out_grad, out_hess = outter_distance(f, p, A, b, *args, **kwargs)
-    in_dist, in_grad, in_hess = inner_distance(f, p, A, b, *args, **kwargs)
+    out_dist, out_grad, out_hess = outter_distance(f, p, A, b, r=r, h=h)
+    in_dist, in_grad, in_hess = inner_distance(f, p, A, b, r=r, h=h)
     if bulge:
         in_dist, in_grad, in_hess = bulging(in_dist, in_grad, in_hess, p, pc, R, eps=eps, out=False)
         in_dist, in_grad, in_hess = -in_dist, -in_grad, -in_hess
@@ -469,7 +539,7 @@ def e_s_hat(
         return out_dist + in_dist, out_grad + in_grad, out_hess + in_hess
     
 ################## SOLVE RELATED FUNCTIONS ##################
-
+@njit
 def deform_path(
     init_path,
     obstacles,
@@ -487,7 +557,7 @@ def deform_path(
     num_grads = []
     for j, p_ in enumerate(init_path.T):
         p = p_.copy().reshape(-1, 1)
-        dist, grad = 0, np.zeros((1, path.shape[0]))
+        dist, grad = 0.0, np.zeros((1, path.shape[0]))
         num_grad = np.zeros((1, path.shape[0]))
         for i, obstacle in enumerate(obstacles):
             pc = pc_list[i]
@@ -501,7 +571,7 @@ def deform_path(
         dists.append(dist)
         grads.append(grad.T / (np.linalg.norm(grad) + 1e-8))
         num_grads.append(num_grad.T / (np.linalg.norm(num_grad) + 1e-8))
-    min_idx = np.argmin(dists)
+    min_idx = np.argmin(np.asarray(dists))
     min_dist, min_grad = dists[min_idx], grads[min_idx]
 
     for j in range(path.shape[1]):
@@ -559,6 +629,7 @@ class OptimalPathProblem:
         min_path,
         r,
         h,
+        kind='in'
     ):
         self.N = n_points
         self.d = q0.shape[0]
@@ -576,12 +647,13 @@ class OptimalPathProblem:
         self.min_path = min_path
         self.r = r
         self.h = h
+        self.kind = kind
         self.n = self.N * self.d  # Total number of variables
         self.m = 2 * self.d + (self.N - 1)
 
     def objective(self, x):
         path = x.copy().reshape(self.N, self.d)
-        dists = []
+        dists = 0.0
         for p in path:
             dist = 0
             for i, obs in enumerate(self.obstacles):
@@ -591,7 +663,7 @@ class OptimalPathProblem:
                     A,
                     b,
                     self.phi,
-                    kind="in",
+                    kind=self.kind,
                     bulge=self.bulge,
                     R=self.R_list[i],
                     pc=self.pc_list[i],
@@ -600,8 +672,9 @@ class OptimalPathProblem:
                     h=self.h,
                 )
                 dist += d_
-            dists.append(dist)
-        val = np.sum(dists)
+            dists += dist
+        # val = np.sum(dists)
+        val = dists
         curvature = 0.5 * sum(
             np.linalg.norm(path[i + 2] - 2 * path[i + 1] + path[i]) ** 2
             for i in range(self.N - 2)
@@ -621,7 +694,7 @@ class OptimalPathProblem:
                     A,
                     b,
                     self.phi,
-                    kind="in",
+                    kind=self.kind,
                     bulge=self.bulge,
                     R=self.R_list[i],
                     pc=self.pc_list[i],
@@ -707,7 +780,7 @@ class OptimalPathProblem:
                     A,
                     b,
                     self.phi,
-                    kind="in",
+                    kind=self.kind,
                     bulge=self.bulge,
                     R=self.R_list[i],
                     pc=self.pc_list[i],
@@ -766,15 +839,17 @@ class OptimalPathProblem:
         return i_lower, j_lower
 #%%
 """RANDOM MAP"""
-max_polygons = 20
-max_vertices = 6
+# max_poly = 10, max_vert = 15, seed = 100, max_iter = 100
+max_polygons = 10
+max_vertices = 15
 bounding_box = (-20, -20, 20, 20)
 # Distance between vertices will be at least 2*first element, and at most
 # 2*second element of radius_limits:
 radius_limits = (2, 6)
-q0 = np.array([-15, -15]).reshape(-1, 1)
+q0 = np.array([-3, -12]).reshape(-1, 1)
+q0 = np.array([-8.5, -16]).reshape(-1, 1)
 # qd = np.array([15, 15]).reshape(-1, 1)
-qd = np.array([14, 9]).reshape(-1, 1)
+qd = np.array([11, 15]).reshape(-1, 1)
 n_points = 50
 h = 0.1
 r = 0.8
@@ -782,8 +857,8 @@ eps = 5e-2
 bulge = True
 min_path = True
 k = 5e-1
-max_iters = 1000
-seed = 100 # 100 is cool
+max_iters = 200
+seed = 42 # 100 is cool
 
 obstacles = generate_random_polygon_set(
     n_polygons=max_polygons,
@@ -795,22 +870,20 @@ obstacles = generate_random_polygon_set(
     bbox=bounding_box,
     seed=seed
 )
-A_list, b_list, vertices_list, pc_list, R_list = list(zip(*obstacles))
-constraints = [(A, b) for A, b in zip(A_list, b_list)]
+a_list, b_list, vertices_list, pc_list, R_list = list(zip(*obstacles))
+constraints = [(a, b) for a, b in zip(a_list, b_list)]
 
 lambda_ = np.linspace(0, 1, n_points)
 init_path = (1 - lambda_) * q0 + lambda_ * qd
 path = init_path.copy()
 dists = [-100]
 iter_ = 0
-err_flag = False
 
-# While any dists is negative and iters < max_iters:
+# while any dists is negative and iters < max_iters:
 while np.any(np.array(dists) < -1e-8):
     
     if iter_ > max_iters:
-        print(f"Reached max iterations: {max_iters}")
-        err_flag = True
+        print(f"reached max iterations: {max_iters}")
         break
 
     path, dists, grads, num_grads = deform_path(
@@ -827,16 +900,14 @@ while np.any(np.array(dists) < -1e-8):
     )
 
     if iter_ % 10 == 0:
-        print(f"Iteration {iter_}: min dist = {np.min(dists)}")
+        print(f"iteration {iter_}: min dist = {np.min(dists)}")
 
     iter_ += 1
 
-if not err_flag:
-    print(f"Deformation completed in {iter_} iterations with min dist = {np.min(dists)}")
+print(f"deformation completed in {iter_} iterations with min dist = {np.min(dists)}")
 
 fig = create_planning_plot(
     constraints,
-    vertices_list,
     pc_list,
     R_list,
     q0,
@@ -877,6 +948,7 @@ problem = OptimalPathProblem(
     min_path,
     r,
     h,
+    kind='in'
 )
 
 # Bounds: no bounds on x
@@ -891,7 +963,7 @@ c_U[: 2 * 2] = 0.0
 # Last N-1 are upper bounds only (||p_{i+1} - p_i|| ≤ δ)
 c_U[2 * 2 :] = delta
 # Minimum distance between points is the initial one
-c_L[2*2:] = np.linalg.norm(init_path[:, 2] - init_path[:, 1])
+# c_L[2*2:] = np.linalg.norm(init_path[:, 2] - init_path[:, 1])
 
 nlp = Problem(
     n=problem.n, m=problem.m, problem_obj=problem, lb=x_L, ub=x_U, cl=c_L, cu=c_U
@@ -913,11 +985,13 @@ options = {
     # Disable second-order features
     # 'mehrotra_algorithm': 'no',           # Disable second-order correction
     # 'fast_step_computation': 'no',         # Disable advanced step calc
+    'alpha_for_y': 'primal',  # More aggressive step sizing
+    'recalc_y': 'no',  # Reduces computational overhead
     "mu_strategy": "adaptive",
     # 'linear_solver': 'mumps',
     # Adjust convergence criteria for first-order method
-    "tol": 1e-3,  # Relax tolerance (default 1e-8)
-    "max_iter": 1000,  # Increase iteration limit
+    "tol": 1e-1,  # Relax tolerance (default 1e-8)
+    "max_iter": 100,  # Increase iteration limit
     "acceptable_iter": 10,  # Stop after 10 "good enough" iters
     # Output control
     "print_level": 5,
@@ -937,7 +1011,6 @@ x_opt, info = nlp.solve(init_path.T.flatten())
 opt_path = x_opt.copy().reshape(n_points, 2).T
 fig = create_planning_plot(
     constraints,
-    vertices_list,
     pc_list,
     R_list,
     q0,
@@ -952,6 +1025,111 @@ fig = create_planning_plot(
     h=h,
     bulge=bulge,
     plot_cicles=True
+)
+fig.show()
+
+#%%
+""" TEST NONCONVEX POLYGONS """
+# L shape
+n_points = 50
+max_iters = 100
+h = 0.1
+r = 0.8
+eps = 5e-2
+bulge = True
+min_path = True
+k = 5e-1
+max_iters = 200
+bounding_box = (-6, -6, 6, 6)
+
+seed = 42 # 100 is cool
+# Bottom
+A1 = np.array([
+    [1.0, 0],
+    [-1, 0],
+    [0, -1],
+    [0, 1],
+])
+# b1 = np.array([2.0, 0, 0, 1])
+b1 = np.array([2.0, 2,0, 0, 1])
+# Top
+A2 = np.array([
+    [1.0, 0],
+    [-1, 0],
+    [0, 1],
+    [0, -1],
+])
+
+b2 = np.array([1.0, 0, 3, -1])
+constraints = [(A1, b1), (A2, b2)]
+R_list, pc_list = [], []
+
+q0 = np.array([-5.0, -5]).reshape(-1, 1)
+qd = np.array([5, 5.0]).reshape(-1, 1)
+
+for A, b in constraints:
+    interior_point = find_strictly_feasible_point(A, b)
+    halfspaces = np.hstack((A, -b[:, None]))
+    hs = HalfspaceIntersection(halfspaces, interior_point)
+    vertices = hs.intersections
+    center = np.mean(vertices, axis=0)
+    radius = np.max(np.linalg.norm(vertices - center, axis=1)).item()
+    pc_list.append(center)
+    R_list.append(radius)
+
+# constraints = [(a, b) for a, b in zip(a_list, b_list)]
+
+lambda_ = np.linspace(0, 1, n_points)
+init_path = (1 - lambda_) * q0 + lambda_ * qd
+path = init_path.copy()
+dists = [-100]
+iter_ = 0
+
+# while any dists is negative and iters < max_iters:
+while np.any(np.array(dists) < -1e-8):
+    if iter_ > max_iters:
+        print(f"reached max iterations: {max_iters}")
+        break
+
+    path, dists, grads, num_grads = deform_path(
+        path,
+        constraints,
+        R_list=R_list,
+        pc_list=pc_list,
+        h=h,
+        r=r,
+        eps=eps,
+        bulge=bulge,
+        min_path=min_path,
+        k=k,
+    )
+
+    if iter_ % 10 == 0:
+        print(f"iteration {iter_}: min dist = {np.min(dists)}")
+
+    iter_ += 1
+
+print(f"deformation completed in {iter_} iterations with min dist = {np.min(dists)}")
+
+fig = create_planning_plot(
+    constraints,
+    pc_list,
+    R_list,
+    q0,
+    qd,
+    path,
+    init_path,
+    bbox=bounding_box,
+    n_points=n_points,
+    n_points_contour=40,
+    kind_countor='in',
+    eps=eps,
+    r=r,
+    h=h,
+    bulge=bulge,
+    plot_cicles=True,
+    ignore=[3],
+    test_=True
 )
 fig.show()
 
