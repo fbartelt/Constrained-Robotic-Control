@@ -212,7 +212,7 @@ def add_level_sets(
         for i, (A_, b_) in enumerate(constraints):
             if ignore:
                 keep_mask = np.ones(A_.shape[0], dtype=bool)
-                keep_mask[ignore] = False
+                keep_mask[ignore[i]] = False
                 A = A_[keep_mask]
                 b = b_[keep_mask]
                 d_test, *_ = e_s_hat(
@@ -261,6 +261,12 @@ def add_level_sets(
             e_s = np.minimum(np.min(pi_dists), dist_wo_const) # THIS WORKS
             # e_s = np.minimum(dist_w_const, dist_wo_const)
             e_s = -r_ * np.log(np.exp(-dist_wo_const/r_) + np.exp(-dist_w_const/r_))
+            # e_s = -np.maximum(-e_s, np.sum(-pi_dists))
+            e_s = ((0.5 * ((-e_s)**(1/r_) + (-np.sum(pi_dists))**(1/r_))
+                    ) ** (r_))
+            # e_s = -(0.5 *
+            #          (np.sum(-pi_dists)**(1/r_) + np.sum(-test_dists)**(1/r_))
+            #        ) ** (r_)
             # e_s = (0.5 *
             #        (-dist_wo_const)**(1/r) + (-np.min(pi_dists))**(1/r)
             #        ) ** (1/r)
@@ -1043,26 +1049,50 @@ max_iters = 200
 bounding_box = (-6, -6, 6, 6)
 
 seed = 42 # 100 is cool
-# Bottom
+# Bottom horizontal
 A1 = np.array([
     [1.0, 0],
     [-1, 0],
     [0, -1],
     [0, 1],
 ])
-# b1 = np.array([2.0, 0, 0, 1])
-b1 = np.array([2.0, 2,0, 0, 1])
-# Top
+b1 = np.array([2.0, 0, 0, 1])
+# b1 = np.array([2.0, 2.0, 0, 1])
+# Vertical
 A2 = np.array([
     [1.0, 0],
     [-1, 0],
     [0, 1],
     [0, -1],
 ])
-
 b2 = np.array([1.0, 0, 3, -1])
-constraints = [(A1, b1), (A2, b2)]
+# Top horizontal
+A3 = np.array([
+    [1.0, 0],
+    [-1, 0],
+    [0, -1],
+    [0, 1],
+])
+b3 = np.array([2.0, 0, -3, 4])
+A4 = np.array([
+    [-1.0, 0],
+    [-1, 1],
+    [1, 1],
+    [1, -1],
+    [-2, -1]
+])
+b4 = np.array([-2.0, 2, 8, 2, -7])
+A5 = np.array([
+    [1.0, 0],
+    [-1, -1],
+    [-1, 1]
+])
+b5 = np.array([0.0, -1, 3])
+
+constraints = [(A1, b1), (A2, b2), (A3, b3), ]#(A4, b4), (A5, b5)]
 R_list, pc_list = [], []
+ignore = [[3], [1, 2, 3], [0, 2], [0], [0]]
+ignore = [[3], [2, 3], [2]]
 
 q0 = np.array([-5.0, -5]).reshape(-1, 1)
 qd = np.array([5, 5.0]).reshape(-1, 1)
@@ -1117,8 +1147,8 @@ fig = create_planning_plot(
     R_list,
     q0,
     qd,
-    path,
-    init_path,
+    path*0,
+    init_path*0,
     bbox=bounding_box,
     n_points=n_points,
     n_points_contour=40,
@@ -1127,8 +1157,8 @@ fig = create_planning_plot(
     r=r,
     h=h,
     bulge=bulge,
-    plot_cicles=True,
-    ignore=[3],
+    plot_cicles=False,
+    ignore=ignore,
     test_=True
 )
 fig.show()
