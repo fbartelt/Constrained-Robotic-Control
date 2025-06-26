@@ -7,6 +7,14 @@ from scipy.spatial import HalfspaceIntersection, ConvexHull, Delaunay
 from scipy.optimize import linprog
 from cyipopt import Problem
 from numba import njit
+# To display in notebook
+from IPython.display import HTML, display
+import webbrowser
+from pathlib import Path
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from matplotlib.colors import LinearSegmentedColormap
+
 ################## POLYGON RELATED FUNCTIONS ##################
 
 def get_polytope_vertices_opt(A, b, tol=1e-6):
@@ -195,6 +203,7 @@ def add_level_sets(
         bulge=True,
         bbox=(-5, -5, 5, 5),
         n_points=100,
+        n_countours=50,
         ignore=[],
         test_=False):
     x_min, y_min, x_max, y_max = bbox
@@ -260,10 +269,10 @@ def add_level_sets(
             # dist_w_const = np.min(pi_dists)
             e_s = np.minimum(np.min(pi_dists), dist_wo_const) # THIS WORKS
             # e_s = np.minimum(dist_w_const, dist_wo_const)
-            e_s = -r_ * np.log(np.exp(-dist_wo_const/r_) + np.exp(-dist_w_const/r_))
-            # e_s = -np.maximum(-e_s, np.sum(-pi_dists))
-            e_s = ((0.5 * ((-e_s)**(1/r_) + (-np.sum(pi_dists))**(1/r_))
-                    ) ** (r_))
+            # e_s = -r_ * np.log(np.exp(-dist_wo_const/r_) + np.exp(-dist_w_const/r_))
+            # # e_s = -np.maximum(-e_s, np.sum(-pi_dists))
+            # e_s = -((0.5 * ((-e_s)**(1/r_) + (-np.sum(pi_dists))**(1/r_))
+            #         ) ** (r_))
             # e_s = -(0.5 *
             #          (np.sum(-pi_dists)**(1/r_) + np.sum(-test_dists)**(1/r_))
             #        ) ** (r_)
@@ -280,7 +289,7 @@ def add_level_sets(
         y=p2,
         z=distances,
         colorscale="RdBu",
-        ncontours=50,
+        ncontours=n_countours,
         # contours=dict(
         #     start=0,
         #     end=np.max(distances),
@@ -300,6 +309,7 @@ def create_planning_plot(
         bbox=(-5, -5, 5, 5),
         n_points=100,
         n_points_contour=None,
+        n_countours=50,
         kind_countor=None,
         eps=1e-3,
         r=1e-1,
@@ -386,7 +396,8 @@ def create_planning_plot(
         kind=kind_countor,
         bulge=bulge,
         bbox=bbox,
-        n_points=n_points,
+        n_points=n_points_contour,
+        n_countours=n_countours,
         ignore=ignore,
         test_=test_,
     )
@@ -396,6 +407,77 @@ def create_planning_plot(
     )
 
     return fig
+
+def add_polygon_plt(ax, A, b, alpha=0.5, color=(0.64, 0.62, 0.61)):
+    """Add polygon to matplotlib axes"""
+    vertices = get_polytope_vertices_opt(A, b)
+    hull = ConvexHull(vertices)
+    poly_vertices = vertices[hull.vertices]
+    ax.fill(
+        poly_vertices[:, 0],
+        poly_vertices[:, 1],
+        color=color,
+        alpha=alpha,
+        edgecolor=color,
+        linewidth=1,
+    )
+
+def animate_deformation_matplotlib(
+    path_list,
+    init_path,
+    obstacles,
+    q0,
+    qd,
+    p1,
+    p2,
+    distances,
+    frame_delay=200,  # ms between frames
+):
+    # Create static figure and axes
+    fig, ax = plt.subplots(figsize=(10, 8))
+    n_iters = len(path_list)
+    # Precompute all paths
+    paths = [init_path.copy()]
+    paths.extend(path_list)
+
+    # Setup static elements
+    # Create RdBu-like colormap
+    cmap = LinearSegmentedColormap.from_list("RdBu", ["#2166ac", "#f7f7f7", "#b2182b"])
+    contour = ax.contourf(p1, p2, distances, levels=20, cmap=cmap, alpha=1.0)
+    cbar = plt.colorbar(contour, ax=ax)
+    cbar.set_label("Distance")
+
+    # Add polygons
+    for A, b in obstacles:
+        add_polygon_plt(ax, A, b)
+
+    ax.plot(q0[0, 0], q0[1, 0], "gx", markersize=10, label="q0")
+    ax.plot(qd[0, 0], qd[1, 0], "b*", markersize=10, label="qd")
+
+    # Initialize path line
+    (path_line,) = ax.plot([], [], "ok-", linewidth=2)
+
+    # Add legend and set limits
+    ax.legend()
+    ax.set_xlim(np.min(p1), np.max(p1))
+    ax.set_ylim(np.min(p2), np.max(p2))
+    ax.set_aspect("equal", "box")
+    ax.set_title("Path Deformation Animation")
+    ax.grid(True)
+
+    # Animation update function
+    def update(frame):
+        path = paths[frame]
+        path_line.set_data(path[0, :], path[1, :])
+        ax.set_title(f"Deformation Step: {frame}/{n_iters}")
+        return (path_line,)
+
+    # Create animation
+    ani = FuncAnimation(
+        ax.figure, update, frames=n_iters, interval=frame_delay, blit=True
+    )
+
+    return ani
 ################## DISTANCE RELATED FUNCTIONS ##################
 
 # def phi(s, h=0.1, *args, **kwargs):
@@ -529,13 +611,17 @@ def e_s_hat(
     eps=1e-3,
     r=0.1,
     h=0.5,
+    eta=1.0,
 ):
     out_dist, out_grad, out_hess = outter_distance(f, p, A, b, r=r, h=h)
     in_dist, in_grad, in_hess = inner_distance(f, p, A, b, r=r, h=h)
     if bulge:
-        in_dist, in_grad, in_hess = bulging(in_dist, in_grad, in_hess, p, pc, R, eps=eps, out=False)
-        in_dist, in_grad, in_hess = -in_dist, -in_grad, -in_hess
+        # in_dist, in_grad, in_hess = bulging(in_dist, in_grad, in_hess, p, pc, R, eps=eps, out=False)
+        # in_dist, in_grad, in_hess = -in_dist, -in_grad, -in_hess
         out_dist, out_grad, out_hess = bulging(out_dist, out_grad, out_hess, p, pc, R, eps=eps)
+
+    in_dist *= eta
+    in_grad *= eta
 
     if kind == "out":
         return out_dist, out_grad, out_hess
@@ -551,50 +637,72 @@ def deform_path(
     obstacles,
     R_list=[],
     pc_list=[],
+    kind='in',
     h=0.1,
     r=0.8,
     eps=5e-2,
     bulge=False,
     min_path=False,
     k=1.0,
+    zeta=1.0,
+    alpha=1.0,
+    eta=10.0,
 ):
     path = init_path.copy()
     dists, grads = [], []
-    num_grads = []
     for j, p_ in enumerate(init_path.T):
         p = p_.copy().reshape(-1, 1)
         dist, grad = 0.0, np.zeros((1, path.shape[0]))
-        num_grad = np.zeros((1, path.shape[0]))
         for i, obstacle in enumerate(obstacles):
             pc = pc_list[i]
             R = R_list[i]
             A, b = obstacle
             dist_, grad_, _ = e_s_hat(
-                p, A, b, phi, kind="in", bulge=bulge, R=R, pc=pc, eps=eps, r=r, h=h
+                p, A, b, phi, kind=kind, bulge=bulge, R=R, pc=pc, eps=eps, r=r, h=h, eta=eta
             )
-            dist += dist_
-            grad += grad_.reshape(1, -1)
+            if kind == 'both':
+                # if dist_ < dist:
+                #     if dist < 0:
+                #         dist += dist_
+                #         grad += grad_
+                #     else:
+                #         dist = dist_
+                #         grad = grad_
+                # else:
+                dist += -1/alpha * np.log(np.exp(-alpha * dist_)/2 + 0.5)
+                expterm = (1.0 / (np.exp(alpha * dist_) + 1.0))
+                # print(dist_, expterm, -1/alpha * np.log(np.exp(-alpha * dist_)/2 + 0.5))
+                grad += expterm * grad_.reshape(1, -1)
+            else:
+                dist += dist_
+                grad += grad_.reshape(1, -1)
         dists.append(dist)
-        grads.append(grad.T / (np.linalg.norm(grad) + 1e-8))
-        num_grads.append(num_grad.T / (np.linalg.norm(num_grad) + 1e-8))
+        # grads.append(grad.T / (np.linalg.norm(grad) + 1e-8))
+        grads.append(grad.T)
+
     min_idx = np.argmin(np.asarray(dists))
     min_dist, min_grad = dists[min_idx], grads[min_idx]
 
-    for j in range(path.shape[1]):
+    for j in range(path.shape[1] - 2):
+        k = j + 1 # Do not change initial and final point
         # const_obs = [b - A @ path[:, j].reshape(-1, 1) for A, b in obstacles]
         # err = np.max(const_obs)
         # coeff = np.abs(dists[j])  # np.sign(dists[j]) * np.sqrt(np.abs(dists[j]))
-        coeff = np.sqrt(np.abs(dists[j]))
-        path[:, j] += (grads[j] * coeff).ravel()
+        coeff = 1.0
+        if dists[k] > 0:
+            coeff = np.sqrt(np.abs(dists[k]))
+        else:
+            coeff = np.sqrt(np.abs(dists[k]))
+        path[:, k] += grads[k] * coeff
 
     if min_path:
         for j, point in enumerate(path.T[1:-1]):
             k = j + 1
             prev_grad = path[:, k - 1].ravel() - point.ravel()
             next_grad = path[:, k + 1].ravel() - point.ravel()
-            path[:, k] = point + (prev_grad + next_grad) * 0.5
+            path[:, k] = point + zeta*(prev_grad + next_grad)
 
-    return path, dists, grads, num_grads
+    return path, dists, grads, 0.0
 
 # GARBAGE IDEA FOR LEVEL SETS INTERPOLATION
 # def minminmin(x_fixed, x_vary, y_fixed, y_vary, A_list, b_list, func, *args, **kwargs):
@@ -616,7 +724,6 @@ def deform_path(
 #
 #     return np.minimum(np.min(f_verticals), np.min(f_horizontals))
 #
-
 class OptimalPathProblem:
     def __init__(
         self,
@@ -856,15 +963,15 @@ q0 = np.array([-3, -12]).reshape(-1, 1)
 q0 = np.array([-8.5, -16]).reshape(-1, 1)
 # qd = np.array([15, 15]).reshape(-1, 1)
 qd = np.array([11, 15]).reshape(-1, 1)
-n_points = 50
-h = 0.1
+n_points = 100
+h = 1.1
 r = 0.8
 eps = 5e-2
 bulge = True
 min_path = True
 k = 5e-1
-max_iters = 200
-seed = 42 # 100 is cool
+max_iters = 500
+seed = 69 # 42 NICE post mods, 100 is cool
 
 obstacles = generate_random_polygon_set(
     n_polygons=max_polygons,
@@ -884,9 +991,11 @@ init_path = (1 - lambda_) * q0 + lambda_ * qd
 path = init_path.copy()
 dists = [-100]
 iter_ = 0
+path_hist = []
 
 # while any dists is negative and iters < max_iters:
-while np.any(np.array(dists) < -1e-8):
+# while np.any(np.array(dists) < -1e-8):
+while iter_ < max_iters:
     
     if iter_ > max_iters:
         print(f"reached max iterations: {max_iters}")
@@ -900,10 +1009,15 @@ while np.any(np.array(dists) < -1e-8):
         h=h,
         r=r,
         eps=eps,
+        kind='both',
         bulge=bulge,
         min_path=min_path,
         k=k,
+        zeta=0.5,
+        alpha=np.log(2)/0.2,
+        eta=4.0
     )
+    path_hist.append(path)
 
     if iter_ % 10 == 0:
         print(f"iteration {iter_}: min dist = {np.min(dists)}")
@@ -922,15 +1036,69 @@ fig = create_planning_plot(
     init_path,
     bbox=bounding_box,
     n_points=n_points,
-    n_points_contour=40,
+    n_points_contour=100,
+    n_countours=20,
     eps=eps,
     r=r,
     h=h,
     bulge=bulge,
-    plot_cicles=True
+    plot_cicles=False
 )
 fig.show()
+# %%
+""" PLOTLY ANIMATION 1ST"""
+x_min, y_min, x_max, y_max = bounding_box
+p1 = np.linspace(x_min, x_max, 100)
+p2 = np.linspace(y_min, y_max, 100)
+P1, P2 = np.meshgrid(p1, p2)
+P = np.vstack([P1.ravel(), P2.ravel()]).T
+distances = []
 
+for j, pi_ in enumerate(P):
+    # print(j)
+    pi = pi_.copy().reshape(-1, 1)
+    pi_dists = []
+    test_dists = []
+    for i, (A_, b_) in enumerate(constraints):
+        A = A_
+        b = b_
+        d_, *_ = e_s_hat(
+            pi,
+            A,
+            b,
+            phi,
+            kind='both',
+            bulge=bulge,
+            pc=pc_list[i],
+            R=R_list[i],
+            eps=eps,
+            r=r,
+            h=h,
+        )
+        pi_dists.append(d_)
+    e_s = np.min(pi_dists)
+    distances.append(e_s)
+
+distances = np.array(distances).reshape(P1.shape)
+
+
+def show_animation(animation, filename="anim.html"):
+    path = Path(filename).absolute()
+    animation.save(path, writer="html")
+    webbrowser.open(f"file://{path}")
+
+animation = animate_deformation_matplotlib(
+    path_hist,
+    init_path,
+    constraints,
+    q0,
+    qd,
+    p1,
+    p2,
+    distances,
+    frame_delay=(5/len(path_hist))*1000,
+)
+show_animation(animation)
 # %%
 """RANDOM MAP IPOPT"""
 kappa = 1
@@ -1089,10 +1257,10 @@ A5 = np.array([
 ])
 b5 = np.array([0.0, -1, 3])
 
-constraints = [(A1, b1), (A2, b2), (A3, b3), ]#(A4, b4), (A5, b5)]
+constraints = [(A1, b1), (A2, b2), (A3, b3), (A4, b4)]#(A4, b4), (A5, b5)]
 R_list, pc_list = [], []
-ignore = [[3], [1, 2, 3], [0, 2], [0], [0]]
-ignore = [[3], [2, 3], [2]]
+ignore = [[3], [1, 2, 3], [0, 2], [0], ]#[0]]
+# ignore = [[3], [2, 3], [2]]
 
 q0 = np.array([-5.0, -5]).reshape(-1, 1)
 qd = np.array([5, 5.0]).reshape(-1, 1)
@@ -1151,12 +1319,12 @@ fig = create_planning_plot(
     init_path*0,
     bbox=bounding_box,
     n_points=n_points,
-    n_points_contour=40,
+    n_points_contour=100,
     kind_countor='in',
     eps=eps,
     r=r,
     h=h,
-    bulge=bulge,
+    bulge=False,
     plot_cicles=False,
     ignore=ignore,
     test_=True
