@@ -40,6 +40,14 @@ def get_polytope_vertices_opt(A, b, tol=1e-6):
             vertex = np.round(res.x, int(-np.log10(tol)))
             if not any(np.allclose(vertex, v, atol=tol) for v in vertices):
                 vertices.append(vertex)
+    interior_point = find_strictly_feasible_point(A, b)
+    halfspaces = np.hstack((A, -b[:, None]))
+    hs = HalfspaceIntersection(halfspaces, interior_point)
+    reconstructed_vertices = hs.intersections
+
+    # Use ConvexHull to order them
+    hull = ConvexHull(reconstructed_vertices)
+    vertices = reconstructed_vertices[hull.vertices]
 
     return np.array(vertices)
 
@@ -149,7 +157,7 @@ def generate_random_polygon_set(
                 continue
         # Get center of polygon and radius of circumscribed circle
         center = np.mean(vertices, axis=0)
-        radius = np.max(np.linalg.norm(vertices - center, axis=1)).item()
+        radius = 1.001*np.max(np.linalg.norm(vertices - center, axis=1)).item()
 
         # Passed all checks
         polygons.append((A, b, vertices, center, radius))
@@ -199,6 +207,7 @@ def add_level_sets(
         eps=1e-3,
         r=1e-1,
         h=1e-1,
+        eta=1.0,
         kind='both',
         bulge=True,
         bbox=(-5, -5, 5, 5),
@@ -236,6 +245,7 @@ def add_level_sets(
                     eps=eps,
                     r=r,
                     h=h,
+                    eta=eta,
                 )
                 test_dists.append(d_test)
             # else:
@@ -254,6 +264,7 @@ def add_level_sets(
                     eps=eps,
                     r=r,
                     h=h,
+                    eta=eta,
                 )
             pi_dists.append(d_)
         if test_:
@@ -314,6 +325,7 @@ def create_planning_plot(
         eps=1e-3,
         r=1e-1,
         h=1e-1,
+        eta=1.0,
         bulge=True,
         plot_cicles=False,
         ignore=[],
@@ -393,6 +405,7 @@ def create_planning_plot(
         eps=eps,
         r=r,
         h=h,
+        eta=eta,
         kind=kind_countor,
         bulge=bulge,
         bbox=bbox,
@@ -403,7 +416,9 @@ def create_planning_plot(
     )
     # Update layout
     fig.update_layout(
-        xaxis_title="x1", yaxis_title="x2", showlegend=False, width=800, height=600
+        xaxis_title="x", yaxis_title="y", showlegend=False, width=800, height=800,
+        xaxis_range=[bbox[0], bbox[2]], yaxis_range=[bbox[1], bbox[3]],
+        margin=dict(t=0, l=10, r=10, b=10)
     )
 
     return fig
@@ -411,6 +426,7 @@ def create_planning_plot(
 def add_polygon_plt(ax, A, b, alpha=0.5, color=(0.64, 0.62, 0.61)):
     """Add polygon to matplotlib axes"""
     vertices = get_polytope_vertices_opt(A, b)
+    # print(vertices)
     hull = ConvexHull(vertices)
     poly_vertices = vertices[hull.vertices]
     ax.fill(
@@ -669,6 +685,7 @@ def deform_path(
                 #         dist = dist_
                 #         grad = grad_
                 # else:
+                # print("saturating")
                 dist += -1/alpha * np.log(np.exp(-alpha * dist_)/2 + 0.5)
                 expterm = (1.0 / (np.exp(alpha * dist_) + 1.0))
                 # print(dist_, expterm, -1/alpha * np.log(np.exp(-alpha * dist_)/2 + 0.5))
@@ -966,12 +983,14 @@ qd = np.array([11, 15]).reshape(-1, 1)
 n_points = 100
 h = 1.1
 r = 0.8
+eta = 4.0
 eps = 5e-2
+alpha = np.log(2)/0.2
 bulge = True
 min_path = True
 k = 5e-1
 max_iters = 500
-seed = 69 # 42 NICE post mods, 100 is cool
+seed = 1001 #1001, 69 cool, 42 NICE post mods, 100 is cool
 
 obstacles = generate_random_polygon_set(
     n_polygons=max_polygons,
@@ -994,8 +1013,8 @@ iter_ = 0
 path_hist = []
 
 # while any dists is negative and iters < max_iters:
-# while np.any(np.array(dists) < -1e-8):
-while iter_ < max_iters:
+while np.any(np.array(dists) < 2.0):
+# while iter_ < max_iters:
     
     if iter_ > max_iters:
         print(f"reached max iterations: {max_iters}")
@@ -1014,8 +1033,8 @@ while iter_ < max_iters:
         min_path=min_path,
         k=k,
         zeta=0.5,
-        alpha=np.log(2)/0.2,
-        eta=4.0
+        alpha=alpha,
+        eta=eta,
     )
     path_hist.append(path)
 
@@ -1025,7 +1044,7 @@ while iter_ < max_iters:
     iter_ += 1
 
 print(f"deformation completed in {iter_} iterations with min dist = {np.min(dists)}")
-
+# print(dists)
 fig = create_planning_plot(
     constraints,
     pc_list,
@@ -1036,15 +1055,17 @@ fig = create_planning_plot(
     init_path,
     bbox=bounding_box,
     n_points=n_points,
-    n_points_contour=100,
-    n_countours=20,
+    n_points_contour=200,
+    n_countours=40,
     eps=eps,
     r=r,
     h=h,
+    eta=eta,
     bulge=bulge,
     plot_cicles=False
 )
 fig.show()
+# fig.write_image("./TP/media/sim1.pdf")
 # %%
 """ PLOTLY ANIMATION 1ST"""
 x_min, y_min, x_max, y_max = bounding_box
@@ -1074,6 +1095,7 @@ for j, pi_ in enumerate(P):
             eps=eps,
             r=r,
             h=h,
+            eta=eta,
         )
         pi_dists.append(d_)
     e_s = np.min(pi_dists)
@@ -1098,7 +1120,7 @@ animation = animate_deformation_matplotlib(
     distances,
     frame_delay=(5/len(path_hist))*1000,
 )
-show_animation(animation)
+show_animation(animation, filename="anim3.html")
 # %%
 """RANDOM MAP IPOPT"""
 kappa = 1
